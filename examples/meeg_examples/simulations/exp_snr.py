@@ -45,8 +45,13 @@ def run_snr_experiment():
     gamma = 0.1          # Фиксированный уровень сенсорного шума
 
     # ПАРАМЕТРЫ ЭКСПЕРИМЕНТА
+<<<<<<< Updated upstream
     snr_logs = np.arange(-1.4, 1.01, 0.2)  # десятичный логарифм SNR от -1.4 до 1.0
     n_mc_iterations = 2  # количество итераций Монте-Карло (уменьшено для скорости)
+=======
+    snr_logs = np.arange(-0.2, 1.01, 0.1)  # десятичный логарифм SNR от -0.2 до 1.0
+    n_mc_iterations = 10  # количество итераций Монте-Карло
+>>>>>>> Stashed changes
 
     # Для эпохирования
     Wsize = 2.0
@@ -162,6 +167,7 @@ def run_snr_experiment():
             iter_pattern_corrs.append(best_pattern_corr)
             iter_power_corrs.append(best_power_corr)
 
+<<<<<<< Updated upstream
             # ==============================
             # BASELINE: СРАВНЕНИЕ С ICA
             # ==============================
@@ -172,6 +178,27 @@ def run_snr_experiment():
             mne.set_log_level('ERROR')
             ica.fit(raw)
             mne.set_log_level('INFO')
+=======
+            # =================================================================
+            # 2. ICA BASELINE (ФОНОВОЕ СРАВНЕНИЕ)
+            # =================================================================
+            # Ищем 15 компонент, чтобы не перегружать вычисления, но захватить основную дисперсию
+            ica = mne.preprocessing.ICA(n_components=0.999, method='fastica', random_state=42)
+            ica.fit(raw, verbose=False)
+            
+            # Матрица смешивания (mixing matrix) содержит пространственные паттерны ICA
+            ica_patterns = ica.get_components() 
+            
+            # Извлекаем временные ряды источников ICA и режем их на эпохи
+            ica_raw = ica.get_sources(raw)
+            ica_epochs = mne.make_fixed_length_epochs(
+                ica_raw, duration=Wsize, overlap=overlap, preload=True, verbose=False
+            )
+            ica_epochs_data = ica_epochs.get_data(copy=False) # Размер: (n_epochs, n_components, n_samples)
+            
+            best_ica_patt_corr = 0
+            best_ica_pow_corr = 0
+>>>>>>> Stashed changes
 
             # Паттерны ICA - столбцы матрицы в сенсорном пространстве
             ica_patterns = ica.get_components()
