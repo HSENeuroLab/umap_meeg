@@ -14,6 +14,12 @@ repo_root = os.path.abspath(os.path.join(work_dir, "..", "..", ".."))
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
+import sys
+import os
+lib_directory = os.path.abspath("C:/Users/ansbel/Documents/GitHub/pyRiemann") 
+if lib_directory not in sys.path:
+    sys.path.insert(0, lib_directory)
+
 from signal_simulation import generate_distributed_sources
 from pyriemann.estimation import Covariances
 from pyriemann.geometry.distance import pairwise_distance
@@ -38,18 +44,18 @@ def run_snr_experiment():
     Fs = info['sfreq']
 
     # ПАРАМЕТРЫ СИМУЛЯЦИИ
-    Ts = 300.0           # Длительность симуляции в секундах
+    Ts = 400.0           # Длительность симуляции в секундах
     Nsrc = 100           # Общее количество источников
     Ndistr = 1           # Ищем ОДИН целевой источник
     flanker = 1.0        # Фланкеры для фильтрации
     gamma = 0.1          # Фиксированный уровень сенсорного шума
 
     # ПАРАМЕТРЫ ЭКСПЕРИМЕНТА
-    snr_logs = np.arange(-1.4, 1.01, 0.2)  # десятичный логарифм SNR от -1.4 до 1.0
+    snr_logs = np.arange(-0.2, 1.01, 0.1)  # десятичный логарифм SNR от -1.4 до 1.0
     n_mc_iterations = 5  # количество итераций Монте-Карло
 
     # Для эпохирования
-    Wsize = 2.0
+    Wsize = 1.0
     Ssize = 0.5
     overlap = Wsize - Ssize
 
@@ -94,9 +100,9 @@ def run_snr_experiment():
             w_opt, _, final_losses, _, _ = fit_filters(
                 C=covmats,
                 D_matrix=dist_matrix,
-                N_dim=3,                # Вложение в 3D
+                N_dim=2,                # Вложение в 3D
                 K_restarts=1,
-                n_neighbors=20,
+                n_neighbors=30,
                 epochs=300,             # Можно уменьшить для скорости, но лучше оставить 300-500
                 lr=0.05,
                 verbose=False

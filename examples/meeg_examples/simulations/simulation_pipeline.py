@@ -30,6 +30,9 @@ if repo_root not in sys.path:
 from signal_simulation import generate_distributed_sources
 from pyriemann.estimation import Covariances
 from topological_spatial_filter import fit_filters
+lib_directory = os.path.abspath("C:/Users/ansbel/Documents/GitHub/pyRiemann") 
+if lib_directory not in sys.path:
+    sys.path.insert(0, lib_directory)
 
 from pyriemann.geometry.distance import pairwise_distance
 import numpy as np
@@ -57,7 +60,7 @@ G = fwd['sol']['data']
 # 2. НАСТРОЙКА ПАРАМЕТРОВ И ГЕНЕРАЦИЯ
 # =============================================================================
 Fs = info['sfreq']  # Берем частоту дискретизации из оригинальных данных (в eegbci это 160 Гц)
-Ts = 500.0           # Длительность симуляции: 30 секунд
+Ts = 500.0          # Длительность симуляции: 30 секунд
 Nsrc = 100          # Общее количество активных источников в мозге
 Ndistr = 5          # Из них 2 - целевые
 flanker = 1.0       # 1 секунда "фланкеров" для фильтра
