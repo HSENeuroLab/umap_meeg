@@ -1,0 +1,126 @@
+\documentclass[a4paper,12pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[russian]{babel}
+\usepackage{amsmath, amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{geometry}
+\geometry{a4paper, margin=2cm}
+
+\title{Алгоритм топологической пространственной фильтрации (fit\_filters)}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+В данном документе представлено подробное математическое и алгоритмическое описание метода \texttt{fit\_filters}, предназначенного для оптимизации топологических пространственных фильтров. Алгоритм обучается находить пространственные веса, которые проецируют ковариационные матрицы таким образом, чтобы логарифм мощности выходного сигнала в пространстве меньшей размерности аппроксимировал топологическую структуру заданного многообразия, следуя принципам Uniform Manifold Approximation and Projection (UMAP).
+\end{abstract}
+
+\section{Введение}
+Функция \texttt{fit\_filters} реализует процедуру обучения набора (батча) топологических пространственных фильтров, используя принципы дифференцируемого UMAP.
+Входными данными являются ковариационные матрицы $\mathbf{C}_i \in \mathbb{R}^{M \times M}$ (где $M$ --- количество каналов, $i \in \{1, \dots, N_{epochs}\}$), а целевой топологией выступает граф соседства, построенный либо по исходным признакам $\mathbf{T}$, либо по заданной матрице расстояний $\mathbf{D}$.
+
+Алгоритм одновременно обучает $K$ независимых инициализаций (restarts) фильтров размерности $N_{dim}$, чтобы избежать локальных минимумов.
+
+\section{Математическая постановка задачи}
+
+\subsection{Топологический пространственный фильтр}
+Для каждого restart $k \in \{1, \dots, K\}$ и каждой размерности $d \in \{1, \dots, N_{dim}\}$ пространственный фильтр определяется вектором весов $\mathbf{w}_{k,d} \in \mathbb{R}^{M}$ и скалярным параметром масштаба $s_{k,d} > 0$.
+
+Проекция $i$-й ковариационной матрицы $\mathbf{C}_i$ в одномерное пространство для фильтра $\mathbf{w}_{k,d}$ (мощность сигнала после фильтрации) вычисляется как квадратичная форма:
+\begin{equation}
+    P_{k,i,d} = \mathbf{w}_{k,d}^T \mathbf{C}_i \mathbf{w}_{k,d}
+\end{equation}
+
+Координата вложения $y_{k,i,d}$ получается путем логарифмирования мощности и применения обучаемого масштаба:
+\begin{equation}
+    y_{k,i,d} = s_{k,d} \cdot \log(P_{k,i,d} + \epsilon)
+\end{equation}
+где $\epsilon = 10^{-8}$ --- малая константа для вычислительной стабильности, а $s_{k,d} = \exp(\log s_{k,d})$, что гарантирует его положительность.
+
+Векторная координата вложения для $i$-й эпохи и $k$-го restart:
+\begin{equation}
+    \mathbf{y}_{k,i} = [y_{k,i,1}, \dots, y_{k,i,N_{dim}}]^T \in \mathbb{R}^{N_{dim}}
+\end{equation}
+
+\subsection{Целевая топология (UMAP Graph)}
+На основе входных признаков или матрицы расстояний строится нечеткий симплициальный граф (fuzzy simplicial set). Матрица смежности графа $V \in \mathbb{R}^{N_{epochs} \times N_{epochs}}$ содержит вероятности $v_{ij} \in [0, 1]$ наличия ребра между эпохами $i$ и $j$.
+
+\subsection{Функция потерь (UMAP Cross-Entropy)}
+Для каждого restart $k$ рассчитывается функция потерь, представляющая собой перекрестную энтропию (cross-entropy) между исходным графом $v_{ij}$ и графом, индуцированным попарными расстояниями в пространстве вложений $\mathbf{y}_{k,i}$.
+
+Квадрат евклидова расстояния в пространстве вложений:
+\begin{equation}
+    d_{k,ij}^2 = \|\mathbf{y}_{k,i} - \mathbf{y}_{k,j}\|_2^2
+\end{equation}
+
+Вероятность связи в пространстве вложений (согласно UMAP):
+\begin{equation}
+    w_{k,ij} = \frac{1}{1 + a (d_{k,ij}^2)^b}
+\end{equation}
+где $a$ и $b$ --- гиперпараметры UMAP, определяющие форму кривой затухания.
+
+Функция потерь для $k$-го restart:
+\begin{equation}
+    \mathcal{L}_k = \sum_{i \neq j} \left( v_{ij} \log \left( \frac{v_{ij}}{w_{k,ij}} \right) + (1 - v_{ij}) \log \left( \frac{1 - v_{ij}}{1 - w_{k,ij}} \right) \right)
+\end{equation}
+Общая функция потерь для батча является средним по всем $K$ restarts: $\mathcal{L}_{UMAP} = \frac{1}{K} \sum_{k=1}^K \mathcal{L}_k$.
+
+\subsection{Регуляризация масштаба}
+Поскольку фильтры определяются с точностью до масштаба, вводится слабая регуляризация (penalty) на логарифм параметра $s_{k,d}$ (стремление $\log s_{k,d} \to 0$):
+\begin{equation}
+    \mathcal{R}(\log \mathbf{s}) = \lambda \frac{1}{K} \sum_{k=1}^K \sum_{d=1}^{N_{dim}} (\log s_{k,d})^2
+\end{equation}
+где $\lambda$ (\texttt{scale\_reg}) --- коэффициент регуляризации.
+
+Итоговая целевая функция:
+\begin{equation}
+    \mathcal{J} = \mathcal{L}_{UMAP} + \mathcal{R}(\log \mathbf{s})
+\end{equation}
+
+\section{Алгоритм оптимизации}
+
+Оптимизация параметров $\mathbf{w}$ и $\log \mathbf{s}$ производится с помощью алгоритма \textbf{AdamW}.
+
+Особое внимание уделяется предотвращению тривиальных решений (когда веса фильтров стремятся к нулю, а масштаб бесконечно возрастает):
+\begin{enumerate}
+    \item Векторы весов $\mathbf{w}_{k,d}$ жестко нормируются на единичную L2-норму после каждого шага градиентного спуска:
+    \begin{equation}
+        \mathbf{w}_{k,d} \leftarrow \frac{\mathbf{w}_{k,d}}{\|\mathbf{w}_{k,d}\|_2}
+    \end{equation}
+    \item Значения $\log s_{k,d}$ ограничиваются в диапазоне $[\log s_{min}, \log s_{max}]$ (отсечение/clamping).
+\end{enumerate}
+
+\begin{algorithm}[H]
+\caption{Алгоритм \texttt{fit\_filters}}
+\begin{algorithmic}[1]
+\Require Ковариационные матрицы $\{\mathbf{C}_i\}_{i=1}^{N_{epochs}}$, целевой граф $V$, количество restarts $K$, размерность $N_{dim}$, число эпох $E$, learning rate $\alpha$.
+\Ensure Оптимальные фильтры $\mathbf{w}^*$, масштабы $\mathbf{s}^*$.
+\State Инициализация $\mathbf{w} \in \mathbb{R}^{K \times N_{dim} \times M}$ (случайные значения из $\mathcal{N}(0, 1)$ или заданные).
+\State Инициализация $\log \mathbf{s} \in \mathbb{R}^{K \times N_{dim}}$ (нули или заданные).
+\State Настройка оптимизатора AdamW (для $\mathbf{w}$ и $\log \mathbf{s}$) и планировщика ReduceLROnPlateau.
+\For{epoch $= 1, 2, \dots, E$}
+    \State Вычислить мощность $P_{k,i,d} = \mathbf{w}_{k,d}^T \mathbf{C}_i \mathbf{w}_{k,d}$
+    \State Вычислить вложения $\mathbf{y}_{k,i} = \exp(\log s_{k,d}) \cdot \log(P_{k,i,d} + \epsilon)$
+    \State Вычислить UMAP-потери $\mathcal{L}_k$ на основе $\mathbf{y}_{k,i}$ и $V$
+    \State Вычислить регуляризацию $\mathcal{R} = \lambda (\log \mathbf{s})^2$
+    \State $\mathcal{J} = \text{mean}(\mathcal{L}) + \text{mean}(\mathcal{R})$
+    \State Обратное распространение ошибки: $\nabla_{\mathbf{w}} \mathcal{J}$, $\nabla_{\log \mathbf{s}} \mathcal{J}$
+    \State Обновить веса: AdamW.step()
+    \State Проекция весов: $\mathbf{w}_{k,d} \leftarrow \mathbf{w}_{k,d} / \|\mathbf{w}_{k,d}\|_2$
+    \State Ограничение масштабов: $\log \mathbf{s} \leftarrow \text{clamp}(\log \mathbf{s}, \min, \max)$
+    \State Планировщик LR: шаг на основе $\mathcal{J}$
+\EndFor
+\State Пост-обработка: для каждого $k$ оценить индивидуальные потери каждой размерности, отсортировать $\mathbf{w}_{k,d}$ внутри каждого restart.
+\State Отсортировать $K$ restarts по итоговой функции потерь (от лучшего к худшему).
+\State \Return $\mathbf{w}^*$ (лучшие restarts), $\mathbf{s}^*$, истории потерь.
+\end{algorithmic}
+\end{algorithm}
+
+\section{Заключение}
+Описанный алгоритм позволяет находить проекции ковариационных матриц сигналов, в которых логарифм мощности сохраняет нелинейную многообразную структуру исходного пространства признаков или матрицы расстояний. Использование нескольких независимых стартов (restarts) повышает робастность нахождения глобального или хорошего локального минимума сложной целевой функции UMAP.
+
+\end{document}
