@@ -14,19 +14,21 @@ import matplotlib.pyplot as plt
 from scipy.signal import butter, filtfilt, hilbert
 from scipy.linalg import inv, null_space
 
-# Исправленный чистый путь без смеси слэшей
-target_dir = r"C:\Users\ansbel\Documents\GitHub\umap_meeg\examples\meeg_examples\simulations"
+import os
+import sys
 
-if target_dir not in sys.path:
-    sys.path.insert(0, target_dir)
+# Добавляем пути к локальным модулям (относительно файла)
+work_dir = os.path.dirname(os.path.abspath(__file__))
+if work_dir not in sys.path:
+    sys.path.insert(0, work_dir)
+
+# Добавляем корень репозитория в sys.path для импорта topological_spatial_filter
+repo_root = os.path.abspath(os.path.join(work_dir, "..", "..", ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 
 from signal_simulation import generate_distributed_sources
-
-lib_directory = os.path.abspath("C:/Users/ansbel/Documents/GitHub/pyRiemann") 
-if lib_directory not in sys.path:
-    sys.path.insert(0, lib_directory)
 from pyriemann.estimation import Covariances
-
 from topological_spatial_filter import fit_filters
 
 from pyriemann.geometry.distance import pairwise_distance

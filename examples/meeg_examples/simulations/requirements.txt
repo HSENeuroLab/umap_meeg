@@ -1,0 +1,6 @@
+# Simulation scripts dependencies
+mne>=1.0.0
+pyriemann>=0.4
+umap-learn>=0.5.0
+matplotlib>=3.5.0
+scipy>=1.8.0
