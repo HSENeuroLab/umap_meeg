@@ -14,12 +14,6 @@ repo_root = os.path.abspath(os.path.join(work_dir, "..", "..", ".."))
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
-import sys
-import os
-lib_directory = os.path.abspath("C:/Users/ansbel/Documents/GitHub/pyRiemann") 
-if lib_directory not in sys.path:
-    sys.path.insert(0, lib_directory)
-
 from signal_simulation import generate_distributed_sources
 from pyriemann.estimation import Covariances
 from pyriemann.geometry.distance import pairwise_distance
@@ -28,7 +22,7 @@ from topological_spatial_filter import fit_filters
 def run_params_experiment():
     """
     Эксперимент 2: Оценка качества восстановления при варьировании числа соседей (n_neighbors)
-    и метрики расстояния для ковариационных матриц (Riemannian vs euclid).
+    и метрики расстояния для ковариационных матриц (Riemannian vs Euclidean).
     """
     print("Начинаем эксперимент по исследованию гиперпараметров...")
 
@@ -47,13 +41,12 @@ def run_params_experiment():
     Ndistr = 1
     flanker = 1.0
     gamma = 0.1
-    # current_snr = 10 ** 0.4 # Фиксированный SNR (умеренный)
-    current_snr = 5
+    current_snr = 10 ** -0.5 # Фиксированный SNR (умеренный)
 
     # ПАРАМЕТРЫ ЭКСПЕРИМЕНТА
-    neighbors_list = [5, 10, 20, 50, 100, 150, 200]
-    metrics = ['riemann', 'euclid']
-    n_mc_iterations = 3  # Количество итераций для усреднения
+    neighbors_list = [5, 10, 20, 50, 100, 150, 200, 300, 400, 500]
+    metrics = ['riemann', 'euclidean']
+    n_mc_iterations = 2  # Количество итераций для усреднения (уменьшено для скорости)
 
     # Для эпохирования
     Wsize = 2.0
@@ -156,8 +149,8 @@ def run_params_experiment():
     # Построение графиков
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-    colors = {'riemann': 'b', 'euclid': 'r'}
-    labels = {'riemann': 'Riemannian', 'euclid': 'euclid'}
+    colors = {'riemann': 'b', 'euclidean': 'r'}
+    labels = {'riemann': 'Riemannian', 'euclidean': 'Euclidean'}
 
     for metric in metrics:
         ax1.errorbar(neighbors_list, results_pattern[metric]['mean'], yerr=results_pattern[metric]['std'],
