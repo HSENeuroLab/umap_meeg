@@ -339,6 +339,7 @@ def fit_filters(
     T_features: Optional[np.ndarray] = None,
     D_matrix: Optional[np.ndarray] = None,
     labels: Optional[Union[np.ndarray, list]] = None,  
+    target_weight: float = 0.5,          
     unknown_label: int = -1,                           
     w_init: Optional[Union[np.ndarray, torch.Tensor]] = None,
     scale_init: Optional[Union[np.ndarray, torch.Tensor]] = None,

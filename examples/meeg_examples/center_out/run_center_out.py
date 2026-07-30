@@ -47,8 +47,8 @@ selected_band_name = 'Beta (15-25 Hz)'
 l_freq, h_freq = freq_bands[selected_band_name]
 
 # Параметры скользящего окна
-w_size_sec = 0.25   
-w_step_sec = 0.1   
+w_size_sec = 0.5   
+w_step_sec = 0.25   
 
 baseline_window = (-1.0, 0.0) # Окно для бейзлайна ERD/ERS (в секундах)
 event_time = 0.0             # Время стимула/начала движения
@@ -107,7 +107,7 @@ eigvals = eigvals[idx_sorted]
 
 # Фильтруем компоненты с положительной дисперсией
 component_variances = np.diag(W_ssd_full.T @ C_signal @ W_ssd_full)
-EPSILON = 1e-9
+EPSILON = 1e-6
 valid_components = [v > EPSILON for v in component_variances]
 W_ssd = W_ssd_full[:, valid_components]
 variances_filtered = component_variances[valid_components]
@@ -150,8 +150,9 @@ for i, t in enumerate(unique_window_times):
     if t < event_time:
         trial_labels[i] = 0
     else:
-        trial_labels[i] = current_post_stim_label
-        current_post_stim_label += 1
+        # trial_labels[i] = current_post_stim_label
+        # current_post_stim_label += 1
+        trial_labels[i] = 1
 
 # Тиражируем метки на все трайлы (длина будет n_trials * n_windows)
 labels = np.tile(trial_labels, n_trials)
@@ -172,8 +173,8 @@ covmats = Covariances(estimator='oas').fit_transform(all_windows_ssd)
 # 5. РИМАНОВА ДЕФЛЯЦИЯ (БЕЗ ОТБЕЛИВАНИЯ)
 # -----------------------------------------------------------------
 # Параметры TSF и Дефляции
-n_iters = 1        # Количество итераций дефляции
-N_dim = 2            # Сколько компонент извлекаем за одну итерацию
+n_iters = 2        # Количество итераций дефляции
+N_dim = 5            # Сколько компонент извлекаем за одну итерацию
 n_neighbors = 25
 total_components = n_iters * N_dim
 
@@ -193,8 +194,8 @@ for it in range(n_iters):
     # 5.1 Сохраняем топологию текущего касательного пространства (UMAP)
     print("     Вычисление UMAP для текущего подпространства...")
     dist_matrix = pairwise_distance(C_current, metric='riemann')
-    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, metric='precomputed', random_state=42)
-    umap_coords = reducer.fit_transform(dist_matrix)
+    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, metric='precomputed')
+    umap_coords = reducer.fit_transform(dist_matrix, labels=labels)
     umap_coords_history.append(umap_coords)
 
     # 5.2 TSF Оптимизация (многомерная)
@@ -339,10 +340,11 @@ print("Построение итогового дашборда...")
 
 umap_cmap = 'plasma' 
 
-fig = plt.figure(figsize=(18, 4.5 * total_components))
-gs = GridSpec(total_components, 3, figure=fig, width_ratios=[1, 1.2, 2.5], wspace=0.2, hspace=0.4)
+TO_PLOT = 5
+fig = plt.figure(figsize=(18, 4.5 * TO_PLOT))
+gs = GridSpec(TO_PLOT, 3, figure=fig, width_ratios=[1, 1.2, 2.5], wspace=0.2, hspace=0.4)
 
-for comp_idx in range(total_components):
+for comp_idx in range(TO_PLOT):
     iter_num = comp_idx // N_dim
     
     A_pattern = found_patterns[comp_idx]
@@ -397,7 +399,7 @@ for comp_idx in range(total_components):
     ax_env.grid(True, axis='both', linestyle=':', alpha=0.6)
     ax_env.set_xlim([times[0], times[-1]])
     
-    if comp_idx == total_components - 1:
+    if comp_idx == TO_PLOT - 1:
         ax_env.set_xlabel('Время (с)', fontsize=12)
     else:
         ax_env.set_xticklabels([])
