@@ -181,3 +181,96 @@ def generate_correlated_sources(G, Nsrc, Ndistr, flanker, Ts, Fs, rho=0.85):
     X_n = X_n / np.std(X_n, axis=1, keepdims=True)
 
     return X_s, X_bg, X_n, z, GA, S
+
+def generate_manifold_sources(G, Nsrc, Ndistr, flanker, Ts, Fs,
+                              manifold='spiral', noise_power=0.1, rho=0.85):
+    """
+    Генерирует источники, чьи мощности лежат на низкоразмерном многообразии.
+    Добавлен параметр `rho` для фазовой синхронизации (слом ICA).
+    """
+    N = int(Ts * Fs)
+    flanker_samples = int(flanker * Fs)
+
+    b, a = butter(5, [8 / (Fs / 2), 12 / (Fs / 2)], btype='bandpass')
+    b_lp, a_lp = butter(5, 0.5 / (Fs / 2), btype='lowpass')
+
+    Gx, Gy, Gz = G[:, 0::3], G[:, 1::3], G[:, 2::3]
+    Nsens, Nsites = Gx.shape
+    GA = np.zeros((Nsens, Nsrc))
+    src_inds = np.random.permutation(Nsites)
+    for i in range(Nsrc):
+        r = np.random.rand(3); r /= np.linalg.norm(r)
+        GA[:, i] = Gx[:, src_inds[i]]*r[0] + Gy[:, src_inds[i]]*r[1] + Gz[:, src_inds[i]]*r[2]
+
+    # 1. Создание скрытого 2D-многообразия
+    t = np.linspace(0, 1, N)
+    if manifold == 'spiral':
+        theta = t * 4 * np.pi
+        x = theta * np.cos(theta)
+        y = theta * np.sin(theta)
+    elif manifold == 's_curve':
+        x = t * 2 - 1
+        y = np.sin(2 * np.pi * t)
+    elif manifold == 'torus':
+        u = t * 2 * np.pi
+        v = t * 4 * np.pi
+        x = (2 + np.cos(v)) * np.cos(u)
+        y = (2 + np.cos(v)) * np.sin(u)
+    else:
+        raise ValueError("Unknown manifold type")
+
+    x = (x - x.mean()) / x.std()
+    y = (y - y.mean()) / y.std()
+    true_manifold = np.column_stack((x, y))
+
+    # 2. Создание мощностей (z_target)
+    z_target = np.zeros((Ndistr, N))
+    for k in range(Ndistr):
+        if k == 0: f = np.sin(x) * np.cos(y)
+        elif k == 1: f = np.cos(x) * np.sin(y)
+        elif k == 2: f = np.sin(x + y)
+        elif k == 3: f = np.cos(x - y)
+        else: f = np.sin(2*x) + np.cos(2*y)
+        f -= f.min()
+        f = f / f.std() + 0.5
+        z_target[k] = f
+    z_target += np.random.randn(Ndistr, N) * noise_power
+
+    # 3. Генерация несущих (С ДОБАВЛЕНИЕМ СИНХРОНИЗАЦИИ RHO ДЛЯ СЛОМА ICA)
+    raw_noise = np.random.randn(Nsrc, N + 2*flanker_samples)
+    shared_carrier = np.random.randn(N + 2*flanker_samples) # Общая фаза
+    
+    for k in range(Ndistr):
+        raw_noise[k] = np.sqrt(1 - rho**2) * raw_noise[k] + rho * shared_carrier
+
+    S_full = filtfilt(b, a, raw_noise, axis=1)
+    S = S_full[:, flanker_samples : -flanker_samples] if flanker_samples > 0 else S_full.copy()
+
+    z = np.ones((Nsrc, N))
+    for k in range(Nsrc):
+        analytic = hilbert(S[k, :])
+        env = np.abs(analytic)
+        S_norm = S[k, :] / env
+
+        if k < Ndistr:
+            amp_mod = z_target[k, :]
+        else:
+            noise_mod = np.random.randn(N + 2*flanker_samples)
+            lp_noise_full = filtfilt(b_lp, a_lp, noise_mod)
+            lp_noise = lp_noise_full[flanker_samples : -flanker_samples] if flanker_samples > 0 else lp_noise_full.copy()
+            lp_noise /= lp_noise.std()
+            amp_mod = lp_noise - np.min(lp_noise) + 0.05
+
+        S[k, :] = S_norm * amp_mod
+        sigma_s = np.std(S[k, :])
+        S[k, :] /= sigma_s
+        z[k, :] = (amp_mod / sigma_s)**2 
+
+    X_s = GA[:, :Ndistr] @ S[:Ndistr, :]
+    X_bg = GA[:, Ndistr:] @ S[Ndistr:, :]
+
+    X_n = np.random.randn(Nsens, N)
+    X_n -= X_n.mean(axis=1, keepdims=True)
+    X_n /= np.std(X_n, axis=1, keepdims=True)
+
+    return X_s, X_bg, X_n, z, GA, S, true_manifold

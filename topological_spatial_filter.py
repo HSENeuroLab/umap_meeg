@@ -338,6 +338,8 @@ def fit_filters(
     K_restarts: int,
     T_features: Optional[np.ndarray] = None,
     D_matrix: Optional[np.ndarray] = None,
+    labels: Optional[Union[np.ndarray, list]] = None,  
+    unknown_label: int = -1,                           
     w_init: Optional[Union[np.ndarray, torch.Tensor]] = None,
     scale_init: Optional[Union[np.ndarray, torch.Tensor]] = None,
     n_neighbors: int = 15,
@@ -393,6 +395,7 @@ def fit_filters(
     if verbose:
         print(f"Building UMAP graph and moving data to {device}...")
 
+    # Строим базовый топологический граф по данным
     v_ij, umap_a, umap_b = get_umap_graph(
         T_features=T_features,
         D_matrix=D_matrix,
@@ -400,6 +403,31 @@ def fit_filters(
         metric=metric,
     )
     v_ij = v_ij.to(device)
+
+    # =====================================================================
+    # UMAP CATEGORICAL SIMPLICIAL SET INTERSECTION
+    # =====================================================================
+    if labels is not None:
+        if verbose:
+            print("Applying supervised topological intersection based on labels...")
+        
+        labels_t = torch.as_tensor(labels, dtype=torch.float32, device=device)
+        
+        # Матрица совпадения классов: 1.0 если классы одинаковые, 0.0 если разные
+        same_class = (labels_t.unsqueeze(1) == labels_t.unsqueeze(0)).float()
+        
+        # Обработка неизвестных меток (Semi-supervised подход UMAP)
+        is_unknown = (labels_t == unknown_label).float()
+        
+        # Если хотя бы одна из эпох в паре не размечена, мы сохраняем исходную связь
+        keep_original = (is_unknown.unsqueeze(1) + is_unknown.unsqueeze(0) > 0).float()
+        
+        # Итоговая маска: оставляем связь, если классы совпали ИЛИ класс неизвестен
+        intersection_mask = torch.max(same_class, keep_original)
+        
+        # Поэлементное умножение (пересечение графов)
+        v_ij = v_ij * intersection_mask
+    # =====================================================================
 
     model = TopologicalFilterBatch(
         M=M_channels,
