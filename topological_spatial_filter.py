@@ -339,8 +339,9 @@ def fit_filters(
     T_features: Optional[np.ndarray] = None,
     D_matrix: Optional[np.ndarray] = None,
     labels: Optional[Union[np.ndarray, list]] = None,  
-    target_weight: float = 0.5,          
-    unknown_label: int = -1,                           
+    target_metric: str = "categorical", 
+    target_weight: float = 0.5,         
+    unknown_label: int = -1,                               
     w_init: Optional[Union[np.ndarray, torch.Tensor]] = None,
     scale_init: Optional[Union[np.ndarray, torch.Tensor]] = None,
     n_neighbors: int = 15,
@@ -361,21 +362,6 @@ def fit_filters(
 ]:
     """
     Trains K restarts of an N_dim-dimensional topological spatial filter.
-
-    Returns
-    -------
-    w_opt:
-        (K_restarts, N_dim, M_channels)
-    scales_opt:
-        Learned positive coordinate scales,
-        shape (K_restarts, N_dim)
-    final_losses_sorted:
-        Pure final UMAP losses, shape (K_restarts,)
-    loss_history_sorted:
-        Pure UMAP-loss history, shape (epochs, K_restarts)
-    individual_losses_sorted:
-        One-dimensional scaled losses,
-        shape (K_restarts, N_dim)
     """
     if T_features is None and D_matrix is None:
         raise ValueError(
@@ -406,28 +392,77 @@ def fit_filters(
     v_ij = v_ij.to(device)
 
     # =====================================================================
-    # UMAP CATEGORICAL SIMPLICIAL SET INTERSECTION
+    # UMAP TARGET SIMPLICIAL SET INTERSECTION (CATEGORICAL & CONTINUOUS)
     # =====================================================================
     if labels is not None:
         if verbose:
-            print("Applying supervised topological intersection based on labels...")
+            print(f"Applying supervised topological intersection ({target_metric})...")
         
-        labels_t = torch.as_tensor(labels, dtype=torch.float32, device=device)
+        if target_metric == "categorical":
+            # ---------------------------------------------------------
+            # ВАРИАНТ 1: Категориальные метки (Классификация)
+            # ---------------------------------------------------------
+            if target_weight < 1.0:
+                far_dist = 2.5 * (1.0 / (1.0 - target_weight))
+            else:
+                far_dist = 1.0e12
+
+            labels_t = torch.as_tensor(labels, dtype=torch.float32, device=device)
+            is_unknown = (labels_t == unknown_label)
+            same_class = (labels_t.unsqueeze(1) == labels_t.unsqueeze(0))
+            
+            # Матрица штрафов. По умолчанию unknown_dist = 1.0 в UMAP
+            penalty = torch.ones_like(v_ij)
+            
+            # Если хотя бы одна метка неизвестна, штраф exp(-1.0)
+            unknown_mask = is_unknown.unsqueeze(1) | is_unknown.unsqueeze(0)
+            penalty[unknown_mask] = np.exp(-1.0)
+            
+            # Если метки известны, но разные, штраф exp(-far_dist)
+            diff_class_mask = (~unknown_mask) & (~same_class)
+            penalty[diff_class_mask] = float(np.exp(-far_dist))
+            
+            v_ij = v_ij * penalty
+
+        else:
+            # ---------------------------------------------------------
+            # ВАРИАНТ 2: Непрерывные метки (Регрессия)
+            # ---------------------------------------------------------
+            labels_np = np.asarray(labels, dtype=np.float32).reshape(-1, 1)
+            
+            # Строим отдельный UMAP граф по значениям целевой переменной
+            target_v_ij, _, _ = get_umap_graph(
+                T_features=labels_np,
+                n_neighbors=n_neighbors,
+                metric=target_metric
+            )
+            target_v_ij = target_v_ij.to(device)
+            
+            # general_simplicial_set_intersection из оригинального UMAP
+            # Реализация смешивания весов в зависимости от target_weight
+            eps = 1e-8
+            if target_weight < 0.5:
+                power = target_weight / (1.0 - target_weight)
+                v_ij = v_ij * torch.pow(target_v_ij.clamp_min(eps), power)
+            else:
+                if target_weight == 1.0:
+                    power = 0.0 # Предотвращаем деление на 0
+                else:
+                    power = (1.0 - target_weight) / target_weight
+                v_ij = torch.pow(v_ij.clamp_min(eps), power) * target_v_ij
+
+        # ---------------------------------------------------------
+        # ВОССТАНОВЛЕНИЕ ЛОКАЛЬНОЙ СВЯЗНОСТИ (reset_local_connectivity)
+        # ---------------------------------------------------------
+        # Нормализуем каждую строку по максимальному значению, 
+        # чтобы гарантировать наличие хотя бы одного 1-симплекса с весом 1.0
+        row_max = v_ij.max(dim=1, keepdim=True).values.clamp_min(1e-8)
+        v_ij = v_ij / row_max
         
-        # Матрица совпадения классов: 1.0 если классы одинаковые, 0.0 если разные
-        same_class = (labels_t.unsqueeze(1) == labels_t.unsqueeze(0)).float()
-        
-        # Обработка неизвестных меток (Semi-supervised подход UMAP)
-        is_unknown = (labels_t == unknown_label).float()
-        
-        # Если хотя бы одна из эпох в паре не размечена, мы сохраняем исходную связь
-        keep_original = (is_unknown.unsqueeze(1) + is_unknown.unsqueeze(0) > 0).float()
-        
-        # Итоговая маска: оставляем связь, если классы совпали ИЛИ класс неизвестен
-        intersection_mask = torch.max(same_class, keep_original)
-        
-        # Поэлементное умножение (пересечение графов)
-        v_ij = v_ij * intersection_mask
+        # Применяем нечеткое объединение (fuzzy union: a + b - a * b) 
+        # для симметризации графа
+        v_ij_t = v_ij.t()
+        v_ij = v_ij + v_ij_t - (v_ij * v_ij_t)
     # =====================================================================
 
     model = TopologicalFilterBatch(

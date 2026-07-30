@@ -40,18 +40,20 @@ print("===============================================================\n")
 fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/center_out/sub1_center_out_epochs.fif"
 
 freq_bands = {
-    'Mu (9-14 Hz)': [9, 14],
-    'Beta (15-25 Hz)': [9, 14]
+    'Mu': [9, 14],
+    'Beta': [9, 25]
 }
-selected_band_name = 'Beta (15-25 Hz)'
+selected_band_name = 'Beta'
 l_freq, h_freq = freq_bands[selected_band_name]
 
 # Параметры скользящего окна
-w_size_sec = 0.5   
-w_step_sec = 0.25   
+w_size_sec = 1
+w_step_sec = 0.1
 
 baseline_window = (-1.0, 0.0) # Окно для бейзлайна ERD/ERS (в секундах)
 event_time = 0.0             # Время стимула/начала движения
+
+label_mode = 'continuous_speed' # Варианты: 'categorical' или 'continuous_speed'
 
 # %%
 # -----------------------------------------------------------------
@@ -59,9 +61,20 @@ event_time = 0.0             # Время стимула/начала движе
 # -----------------------------------------------------------------
 print(f"Загрузка данных и фильтрация в диапазоне {selected_band_name}...")
 epochs = mne.read_epochs(fpath, preload=True, verbose=False)
+epochs = epochs['d3p2'] # При необходимости фильтрации по условиям
+
+# ИЗВЛЕЧЕНИЕ КИНЕМАТИКИ ДО УДАЛЕНИЯ НЕ-ЭЭГ КАНАЛОВ
+if label_mode == 'continuous_speed':
+    print("Извлечение кинематических данных (скорость)...")
+    vel_idx = [epochs.ch_names.index(ch) for ch in ['Vel_X', 'Vel_Y', 'Vel_Z']]
+    vel_data = epochs.get_data(copy=True)[:, vel_idx, :] # (trials, 3, times)
+    
+    # Скорость (Speed) как L2 норма вектора 3D-скорости
+    speed_data = np.linalg.norm(vel_data, axis=1) # (trials, times)
+
+# Оставляем только ЭЭГ для дальнейшего анализа
 epochs = epochs.pick_types(eeg=True)
 
-# Исходные данные для экстракции огибающих (уже отфильтрованные)
 epochs_filt = epochs.copy().filter(l_freq, h_freq, verbose=False)
 data = epochs_filt.get_data(copy=False)  
 times = epochs_filt.times
@@ -124,6 +137,7 @@ print(f"SSD выполнено: получено {n_components_ssd} компон
 print("\nРазбиение трайлов на скользящие окна...")
 windows_data = []
 window_times = [] 
+window_speeds = [] # Для кинематики
 
 start_idx = 0
 while start_idx + w_size_samp <= n_times:
@@ -131,33 +145,34 @@ while start_idx + w_size_samp <= n_times:
     win_chunk = data[:, :, start_idx:end_idx]
     windows_data.append(win_chunk)
     
+    if label_mode == 'continuous_speed':
+        # Берем кусок скорости, соответствующий окну, и усредняем
+        speed_chunk = speed_data[:, start_idx:end_idx]
+        mean_speed = np.mean(speed_chunk, axis=1) # (trials,)
+        window_speeds.append(mean_speed)
+    
     center_time = times[start_idx + w_size_samp // 2]
     window_times.append(center_time)
     start_idx += w_step_samp
 
-# Меняем порядок: (n_trials * n_windows, n_ch, w_size_samp)
 data_reshaped = np.stack(windows_data, axis=1) 
 all_windows = data_reshaped.reshape(-1, n_channels, w_size_samp)
 
-# --- НОВЫЙ БЛОК: ФОРМИРОВАНИЕ МЕТОК КЛАССОВ ---
-print("Формирование категориальных временных меток...")
-unique_window_times = np.array(window_times)
-trial_labels = np.zeros(len(unique_window_times), dtype=int)
+print(f"Формирование меток для режима: {label_mode}...")
+if label_mode == 'categorical':
+    unique_window_times = np.array(window_times)
+    trial_labels = np.zeros(len(unique_window_times), dtype=int)
+    for i, t in enumerate(unique_window_times):
+        trial_labels[i] = 0 if t < event_time else 1
+    labels = np.tile(trial_labels, n_trials)
+    target_metric = 'categorical'
 
-# Метка 0 для бейзлайна. Для пост-стимула — уникальные ID.
-current_post_stim_label = 1
-for i, t in enumerate(unique_window_times):
-    if t < event_time:
-        trial_labels[i] = 0
-    else:
-        # trial_labels[i] = current_post_stim_label
-        # current_post_stim_label += 1
-        trial_labels[i] = 1
-
-# Тиражируем метки на все трайлы (длина будет n_trials * n_windows)
-labels = np.tile(trial_labels, n_trials)
-time_labels = np.tile(window_times, n_trials) # Оставляем для графиков, если нужно
-# ----------------------------------------------
+elif label_mode == 'continuous_speed':
+    # window_speeds содержит списки длины n_windows, каждый (n_trials,)
+    # Делаем стек и вытягиваем так же, как ЭЭГ окна
+    speeds_reshaped = np.stack(window_speeds, axis=1) # (trials, windows)
+    labels = speeds_reshaped.reshape(-1) # Вытягиваем в 1D
+    target_metric = 'euclidean' # 'euclidean' или 'l2' для непрерывных величин
 
 print("Проекция окон в SSD-пространство...")
 n_win, _, n_samp = all_windows.shape
@@ -165,24 +180,30 @@ all_windows_ssd = np.zeros((n_win, n_components_ssd, n_samp))
 for i in range(n_win):
     all_windows_ssd[i] = W_ssd.T @ all_windows[i]
 
-print(f"Вычисление {len(all_windows_ssd)} ковариационных матриц...")
-covmats = Covariances(estimator='oas').fit_transform(all_windows_ssd)
+from pyriemann.estimation import Covariances
+from pyriemann.utils.base import invsqrtm
+
+covmats = Covariances().fit_transform(all_windows_ssd)
+
+print("Отбеливание ковариационных матриц по среднему арифметическому...")
+C_avg = np.mean(covmats, axis=0)                     
+C_avg_invsqrt = invsqrtm(C_avg)                       
+C_avg_sqrt = np.linalg.inv(C_avg_invsqrt)             
+covmats_white = C_avg_invsqrt @ covmats @ C_avg_invsqrt
 
 # %%
 # -----------------------------------------------------------------
 # 5. РИМАНОВА ДЕФЛЯЦИЯ (БЕЗ ОТБЕЛИВАНИЯ)
 # -----------------------------------------------------------------
-# Параметры TSF и Дефляции
-n_iters = 2        # Количество итераций дефляции
-N_dim = 5            # Сколько компонент извлекаем за одну итерацию
-n_neighbors = 25
-total_components = n_iters * N_dim
+n_iters = 3
+N_dim = 2
+n_neighbors = 30
 
 found_filters = []
 found_patterns = []
 umap_coords_history = []
 
-C_current = covmats.copy()
+C_current = covmats_white.copy()
 A_ssd_accumulated = []
 Q_acc = np.eye(n_components_ssd)
 
@@ -191,20 +212,23 @@ for it in range(n_iters):
     
     C_mean = np.mean(C_current, axis=0)
     
-    # 5.1 Сохраняем топологию текущего касательного пространства (UMAP)
     print("     Вычисление UMAP для текущего подпространства...")
     dist_matrix = pairwise_distance(C_current, metric='riemann')
-    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, metric='precomputed')
-    umap_coords = reducer.fit_transform(dist_matrix, labels=labels)
+    
+    # Передаем target_metric в оригинальный UMAP для корректной визуализации
+    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, 
+                        metric='precomputed', target_metric=target_metric)
+    umap_coords = reducer.fit_transform(dist_matrix, y=labels) # y=labels для UMAP-learn
     umap_coords_history.append(umap_coords)
 
-    # 5.2 TSF Оптимизация (многомерная)
     print("     Оптимизация фильтров...")
     w_opt, scales_opt, final_losses_sorted, loss_history_sorted, individual_losses_sorted = fit_filters(
         C=C_current, 
         D_matrix=dist_matrix, 
         N_dim=N_dim,
         labels=labels,          
+        target_metric=target_metric, 
+        target_weight=0.5,
         unknown_label=-1,       
         K_restarts=1, 
         n_neighbors=n_neighbors, 
@@ -213,34 +237,32 @@ for it in range(n_iters):
         verbose=True
     )
     
-    # Транспонируем (D_curr, N_dim)
     W_cur = w_opt[0].T 
+    C_mean_current = np.mean(C_current, axis=0)
+    A_cur = C_mean_current @ W_cur   
     
-    # Паттерны в текущем подпространстве
-    A_cur = C_mean @ W_cur 
-        
-    # 5.3 Переводим фильтры и паттерны в пространство SSD, а затем в глобальное пространство исходных сенсоров
-    W_ssd_space = Q_acc @ W_cur             # Форма (N_comp_ssd, N_dim)
-    A_ssd_space = Q_acc @ A_cur             # Форма (N_comp_ssd, N_dim)
+    W_ssd_white = Q_acc @ W_cur      
+    A_ssd_white = Q_acc @ A_cur
     
-    W_global = W_ssd @ W_ssd_space          # Форма (N_channels, N_dim)
-    A_global = A_ssd @ A_ssd_space          # Форма (N_channels, N_dim)
+    W_ssd_orig = C_avg_invsqrt @ W_ssd_white   
+    A_ssd_orig = C_avg_sqrt @ A_ssd_white      
     
-    # Сохраняем каждую компоненту отдельно (уже в глобальном пространстве)
+    W_global = W_ssd @ W_ssd_orig
+    A_global = A_ssd @ A_ssd_orig
+    
     for d in range(N_dim):
         found_filters.append(W_global[:, d])
         found_patterns.append(A_global[:, d])
-        
-    A_ssd_accumulated.append(A_ssd_space)
     
-    # 5.4 Дефляция: Проекция ИСХОДНЫХ SSD-данных на накопленное нуль-пространство
+    A_ssd_accumulated.append(A_ssd_white)
+    
     A_stacked = np.hstack(A_ssd_accumulated)
     Q_acc = null_space(A_stacked.T) 
     
-    C_current = np.zeros((covmats.shape[0], Q_acc.shape[1], Q_acc.shape[1]))
-    for i in range(covmats.shape[0]):
-        C_current[i] = Q_acc.T @ covmats[i] @ Q_acc
-
+    C_current = np.zeros((covmats_white.shape[0], Q_acc.shape[1], Q_acc.shape[1]))
+    for i in range(covmats_white.shape[0]):
+        C_current[i] = Q_acc.T @ covmats_white[i] @ Q_acc
+        
 # %%
 # -----------------------------------------------------------------
 # 6. РАСЧЕТ ПРОФИЛЕЙ (ERD/ERS И МОЩНОСТЬ ОКОН)
@@ -340,7 +362,7 @@ print("Построение итогового дашборда...")
 
 umap_cmap = 'plasma' 
 
-TO_PLOT = 5
+TO_PLOT = 6
 fig = plt.figure(figsize=(18, 4.5 * TO_PLOT))
 gs = GridSpec(TO_PLOT, 3, figure=fig, width_ratios=[1, 1.2, 2.5], wspace=0.2, hspace=0.4)
 
@@ -351,7 +373,6 @@ for comp_idx in range(TO_PLOT):
     mean_erd = erd_profiles_mean[comp_idx]
     std_erd = erd_profiles_std[comp_idx]
     
-    # ИСПРАВЛЕНО: используем window_powers вместо старого window_log_powers
     p_vals = window_powers[comp_idx] 
     
     # Отсекаем 5% верхних выбросов для адекватного цветового масштаба
@@ -371,7 +392,6 @@ for comp_idx in range(TO_PLOT):
     
     sort_idx = np.argsort(p_vals)
     
-    # ИСПРАВЛЕНО: добавлена прозрачность alpha=0.4 и убраны края точек edgecolors='none'
     sc = ax_umap.scatter(umap_coords[sort_idx, 0], umap_coords[sort_idx, 1],
                          c=p_vals[sort_idx], cmap=umap_cmap, s=20, zorder=2, 
                          alpha=0.4, edgecolors='none',
@@ -393,11 +413,32 @@ for comp_idx in range(TO_PLOT):
     ax_env.axvspan(baseline_window[0], baseline_window[1], color='gray', alpha=0.2, zorder=0, label='Baseline')
     ax_env.axvline(event_time, color='red', linestyle='--', alpha=0.7, zorder=1, label='Стимул')
     
-    # Линию нуля можно оставить для красоты или как ориентир бейзлайна, если данные центрированы
     ax_env.axhline(0, color='black', linewidth=1, zorder=1)
+    
+    # === НОВЫЙ БЛОК: ОЦЕНКА И ОТРИСОВКА ЗНАЧИМОСТИ ===
+    # Вычисляем стандартную ошибку среднего (SE). n_trials берем из начала скрипта.
+    se_erd = std_erd / np.sqrt(n_trials)
+    
+    # Маска значимости: отклонение больше 1.96 SE (примерно p < 0.05)
+    sig_mask = np.abs(mean_erd) > (1.96 * se_erd)
+    
+    # Получаем лимиты оси Y до отрисовки полоски, чтобы она не растянула график вниз
+    ymin, ymax = ax_env.get_ylim()
+    
+    # Отрисовываем горизонтальный "коврик" внизу графика
+    sig_band_height = (ymax - ymin) * 0.05  # Полоска займет 5% от высоты оси Y
+    ax_env.fill_between(times, ymin, ymin + sig_band_height, where=sig_mask, 
+                        color='darkorange', alpha=0.8, zorder=4, label='p < 0.05')
+    
+    ax_env.set_ylim([ymin, ymax]) # Жестко фиксируем лимиты обратно
+    # =================================================
     
     ax_env.grid(True, axis='both', linestyle=':', alpha=0.6)
     ax_env.set_xlim([times[0], times[-1]])
+    
+    # Чтобы не дублировать легенду на всех графиках, выводим только на первом
+    # if comp_idx == 0:
+    #     ax_env.legend(loc='upper right', fontsize=9)
     
     if comp_idx == TO_PLOT - 1:
         ax_env.set_xlabel('Время (с)', fontsize=12)
@@ -407,3 +448,5 @@ for comp_idx in range(TO_PLOT):
 plt.suptitle(f'TSF Анализ Center-Out + SSD | Диапазон: {selected_band_name}', fontsize=18, y=0.98)
 plt.savefig('tsf_ssd_center_out_dashboard.png', dpi=300, bbox_inches='tight')
 plt.show()
+
+# %%
