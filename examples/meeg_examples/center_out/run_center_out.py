@@ -36,7 +36,11 @@ print("===============================================================\n")
 # -----------------------------------------------------------------
 # 1. ПАРАМЕТРЫ АНАЛИЗА
 # -----------------------------------------------------------------
+<<<<<<< Updated upstream
 fpath = "C:/Users/ansbel/Documents/GitHub/umap_meeg/examples/meeg_examples/center_out/eeg/healthy/Control_11_CenterOut_epochs.fif"
+=======
+fpath = "Z:/asbelokopytov/center_out/eeg/patients/Patient_3_CenterOut_OFF_EEG_clean_epochs.fif"
+>>>>>>> Stashed changes
 
 freq_bands = {
     'Mu': [9, 14],
@@ -50,7 +54,7 @@ w_size_sec = 0.5
 w_step_sec = 0.25
 
 baseline_window = (-1.0, 0.0) # Окно для бейзлайна ERD/ERS (в секундах)
-event_time = 0.0             # Время стимула/начала движения
+event_time = 0.0              # Время стимула/начала движения
 
 label_mode = 'categorical_binary' # Новый режим
 
@@ -61,8 +65,14 @@ label_mode = 'categorical_binary' # Новый режим
 print(f"Загрузка данных и фильтрация в диапазоне {selected_band_name}...")
 epochs_all = mne.read_epochs(fpath, preload=True, verbose=False)
 
+<<<<<<< Updated upstream
 # Список ваших условий
 conditions = ['s1_d4', 's3_d4', 's1_d2', 's3_d2']
+=======
+# %%
+# Список ваших условий
+conditions = ['c1d4', 'c3d4', 'c1d2', 'c3d2']
+>>>>>>> Stashed changes
 epochs_list = [epochs_all[c] for c in conditions]
 
 # Склеиваем эпохи в один объект
@@ -83,6 +93,13 @@ Fs = info['sfreq']
 n_trials, n_channels, n_times = data.shape
 w_size_samp = int(w_size_sec * Fs)
 w_step_samp = int(w_step_sec * Fs)
+
+# %%
+from mne.preprocessing import ICA
+
+ica = ICA(n_components=0.999, random_state=97, method='fastica')
+ica.fit(epochs)
+ica.plot_components()
 
 # %%
 # -----------------------------------------------------------------
@@ -320,7 +337,11 @@ cond_colors = {conditions[0]: 'tab:blue', conditions[1]: 'tab:orange',
                conditions[2]: 'tab:green', conditions[3]: 'tab:red'}
 
 n_comps = len(found_filters)
+<<<<<<< Updated upstream
 comps_per_fig = 2  # РИСУЕМ ПО 2 КОМПОНЕНТЫ НА ГРАФИК
+=======
+comps_per_fig = 3  # РИСУЕМ ПО 2 КОМПОНЕНТЫ НА ГРАФИК
+>>>>>>> Stashed changes
 n_figs = int(np.ceil(n_comps / comps_per_fig))
 
 for fig_idx in range(n_figs):
