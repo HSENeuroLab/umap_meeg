@@ -4,7 +4,6 @@ import sys
 import mne
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib as mpl
 from matplotlib.gridspec import GridSpec
 from scipy.linalg import eigh, null_space
 from scipy.signal import hilbert, butter, filtfilt
@@ -86,11 +85,11 @@ w_size_samp = int(w_size_sec * Fs)
 w_step_samp = int(w_step_sec * Fs)
 
 # %%
-from mne.preprocessing import ICA
+# from mne.preprocessing import ICA
 
-ica = ICA(n_components=0.999, random_state=97, method='fastica')
-ica.fit(epochs)
-ica.plot_components()
+# ica = ICA(n_components=0.999, random_state=97, method='fastica')
+# ica.fit(epochs)
+# ica.plot_components()
 
 # %%
 # -----------------------------------------------------------------
