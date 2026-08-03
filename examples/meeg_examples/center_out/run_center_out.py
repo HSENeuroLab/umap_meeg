@@ -35,8 +35,8 @@ print("===============================================================\n")
 # -----------------------------------------------------------------
 # 1. ПАРАМЕТРЫ АНАЛИЗА
 # -----------------------------------------------------------------
-# fpath = "Z:/asbelokopytov/center_out/eeg/patients/Patient_4_CenterOut_OFF_EEG_clean_epochs.fif"
-fpath = "Z:/asbelokopytov/center_out/eeg/healthy/Control_10_CenterOut_epochs.fif"
+fpath = "Z:/asbelokopytov/center_out/eeg/patients/Patient_4_CenterOut_OFF_EEG_clean_epochs.fif"
+# fpath = "Z:/asbelokopytov/center_out/eeg/healthy/Control_10_CenterOut_epochs.fif"
 
 freq_bands = {
     'Mu': [9, 14],
@@ -174,9 +174,25 @@ C_avg_invsqrt = invsqrtm(C_avg)
 C_avg_sqrt = np.linalg.inv(C_avg_invsqrt)             
 covmats_white = C_avg_invsqrt @ covmats @ C_avg_invsqrt
 
+# =================================================================
+# НОВОЕ: ГЕНЕРАЦИЯ ВРЕМЕННЫХ МЕТОК И ID ТРАЙЛОВ
+# =================================================================
+print("\nФормирование непрерывных временных меток и маски трайлов...")
+
+n_win_per_trial = len(window_times)
+
+# 1. Метки времени: повторяем массив времени окна для каждого трайла
+labels = np.tile(window_times, n_trials)
+target_metric = 'l1'  # 'l1' (Манхэттенское расстояние) отлично подходит для 1D времени
+
+# 2. Идентификаторы трайлов: [0,0,0..., 1,1,1..., 2,2,2...]
+trial_ids = np.repeat(np.arange(n_trials), n_win_per_trial)
+
+print(f"Размерность меток: {labels.shape}, Размерность ID трайлов: {trial_ids.shape}")
+
 # %%
 # -----------------------------------------------------------------
-# 5. РИМАНОВА ДЕФЛЯЦИЯ (БЕЗ ОТБЕЛИВАНИЯ)
+# 5. РИМАНОВА ДЕФЛЯЦИЯ (БЕЗ ОТБЕЛИВАНИЯ ВНУТРИ)
 # -----------------------------------------------------------------
 n_iters = 3
 N_dim = 3
@@ -195,20 +211,22 @@ for it in range(n_iters):
     
     dist_matrix = pairwise_distance(C_current, metric='riemann')
     
-    print("     Вычисление UMAP для текущего подпространства...")
+    print("     Вычисление UMAP для текущего подпространства (только для визуала)...")
     reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, 
                         metric='precomputed', target_metric=target_metric)
+    # Здесь labels - это время. Классический UMAP окрасит точки в градиент от начала к концу трайла
     umap_coords = reducer.fit_transform(dist_matrix, y=labels)
     umap_coords_history.append(umap_coords)
 
-    print("     Оптимизация фильтров...")
+    print("     Оптимизация фильтров с кросс-трайловой маской и временной топологией...")
     w_opt, _, _, _, _ = fit_filters(
         C=C_current, 
         D_matrix=dist_matrix, 
         N_dim=N_dim,             
-        labels=labels,           
-        target_metric=target_metric, 
-        target_weight=0.5,       
+        labels=labels,             # Непрерывное время окна
+        target_metric=target_metric, # 'l1' расстояние по времени
+        target_weight=0.5,         # Баланс между Римановой топологией и временем
+        trial_ids=trial_ids,       # Запрет связей внутри одного трайла
         K_restarts=1, 
         n_neighbors=n_neighbors, 
         epochs=500, 
