@@ -35,7 +35,8 @@ print("===============================================================\n")
 # -----------------------------------------------------------------
 # 1. ПАРАМЕТРЫ АНАЛИЗА
 # -----------------------------------------------------------------
-fpath = "Z:/asbelokopytov/center_out/eeg/patients/Patient_3_CenterOut_OFF_EEG_clean_epochs.fif"
+# fpath = "Z:/asbelokopytov/center_out/eeg/patients/Patient_4_CenterOut_OFF_EEG_clean_epochs.fif"
+fpath = "Z:/asbelokopytov/center_out/eeg/healthy/Control_10_CenterOut_epochs.fif"
 
 freq_bands = {
     'Mu': [9, 14],
