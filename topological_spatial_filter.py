@@ -4,8 +4,8 @@ import torch.optim as optim
 from umap.umap_ import nearest_neighbors, fuzzy_simplicial_set, find_ab_params
 import numpy as np
 from tqdm.auto import tqdm
-from typing import Optional, Union, Tuple
-
+from typing import Optional, Union, Tuple, List
+from sklearn.base import BaseEstimator, TransformerMixin
 
 def get_umap_graph(
     T_features: Optional[np.ndarray] = None,
@@ -171,93 +171,6 @@ class TopologicalFilterBatch(nn.Module):
         return y_raw * self.scale.unsqueeze(1)
 
 
-class NormalizedPatternFilterBatch(nn.Module):
-    """
-    Batched multi-dimensional normalized pattern spatial filter.
-
-    For each epoch i and component d:
-
-        num = a[d]^T B_i^{-1} C_i B_i^{-1} a[d]
-        den = a[d]^T B_i^{-1} a[d]
-
-        y[i, d] = scale[d] * (log(num) - 2 log(den))
-
-    The exponent 2 corresponds to the output power of the unit-gain
-    adaptive filter
-
-        w_i = B_i^{-1} a / (a^T B_i^{-1} a).
-    """
-
-    def __init__(
-        self,
-        M: int,
-        N_dim: int,
-        K_restarts: int,
-        a_init: Optional[torch.Tensor] = None,
-        scale_init: Optional[Union[np.ndarray, torch.Tensor]] = None,
-    ):
-        super().__init__()
-        self.M = M
-        self.N_dim = N_dim
-        self.K = K_restarts
-
-        a_tensor = (
-            torch.randn(K_restarts, N_dim, M, dtype=torch.float32) * 0.1
-        )
-
-        if a_init is not None:
-            a_init = torch.as_tensor(
-                a_init, dtype=torch.float32
-            ).detach().cpu()
-
-            if a_init.ndim != 3 or a_init.shape[1:] != (N_dim, M):
-                raise ValueError(
-                    f"a_init must have shape (K_init, {N_dim}, {M}), "
-                    f"got {tuple(a_init.shape)}."
-                )
-
-            K_init = a_init.shape[0]
-            if K_init > K_restarts:
-                raise ValueError("a_init has more restarts than K_restarts.")
-
-            a_tensor[:K_init] = a_init
-
-        self.a = nn.Parameter(a_tensor)
-        self.log_scale = nn.Parameter(
-            _prepare_scale_init(scale_init, K_restarts, N_dim)
-        )
-
-    @property
-    def scale(self) -> torch.Tensor:
-        return torch.exp(self.log_scale)
-
-    def forward(
-        self,
-        C_num: torch.Tensor,
-        C_den: torch.Tensor,
-    ) -> torch.Tensor:
-        num = torch.einsum(
-            "kdm,nml,kdl->knd",
-            self.a,
-            C_num,
-            self.a,
-        )
-        den = torch.einsum(
-            "kdm,nml,kdl->knd",
-            self.a,
-            C_den,
-            self.a,
-        )
-
-        eps = 1e-8
-        y_raw = (
-            torch.log(num.clamp_min(eps))
-            - 2.0 * torch.log(den.clamp_min(eps))
-        )
-
-        return y_raw * self.scale.unsqueeze(1)
-
-
 def umap_cross_entropy_loss(
     y: torch.Tensor,
     v_ij: torch.Tensor,
@@ -299,16 +212,16 @@ def umap_cross_entropy_loss(
         (1.0 - v_ij_bc)
         / (1.0 - w_kij_clamped)
     )
-
+    
     loss_matrix = term1 + term2
-
+    
     mask = ~torch.eye(
         N_epochs,
         dtype=torch.bool,
         device=y.device,
     )
     masked_loss = loss_matrix * mask.unsqueeze(0)
-
+    
     valid_pairs = N_epochs * (N_epochs - 1)
     return masked_loss.sum(dim=(1, 2)) / valid_pairs
 
@@ -328,299 +241,285 @@ def _scale_regularization_per_restart(
             device=log_scale.device,
             dtype=log_scale.dtype,
         )
-
+    
     return scale_reg * log_scale.square().mean(dim=1)
 
 
-def fit_filters(
-    C: Union[np.ndarray, torch.Tensor],
-    N_dim: int,
-    K_restarts: int,
-    T_features: Optional[np.ndarray] = None,
-    D_matrix: Optional[np.ndarray] = None,
-    labels: Optional[Union[np.ndarray, list]] = None,  
-    target_metric: str = "categorical", 
-    target_weight: float = 0.5,         
-    unknown_label: int = -1,                               
-    w_init: Optional[Union[np.ndarray, torch.Tensor]] = None,
-    scale_init: Optional[Union[np.ndarray, torch.Tensor]] = None,
-    n_neighbors: int = 15,
-    metric: str = "euclidean",
-    epochs: int = 500,
-    lr: float = 0.01,
-    scale_reg: float = 1e-4,
-    log_scale_min: float = -5.0,
-    log_scale_max: float = 5.0,
-    device: Optional[str] = None,
-    verbose: bool = True,
-) -> Tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-]:
+class TopologicalSpatialFilter(BaseEstimator, TransformerMixin):
     """
-    Trains K restarts of an N_dim-dimensional topological spatial filter.
+    Scikit-learn совместимый класс для топологической пространственной фильтрации.
+    Логика разделена: 
+      - fit() формирует целевой топологический граф на основе D_matrices и меток.
+      - transform() ищет оптимальные пространственные фильтры для переданных ковариационных матриц C.
     """
-    if T_features is None and D_matrix is None:
-        raise ValueError(
-            "Must provide either T_features or D_matrix to fit_filters."
-        )
+    def __init__(
+        self,
+        N_dim: int = 2,
+        K_restarts: int = 5,
+        n_neighbors: int = 15,
+        metric: str = "euclidean",
+        target_metric: str = "categorical",
+        target_weight: float = 0.5,
+        unknown_label: int = -1,
+        epochs: int = 500,
+        lr: float = 0.01,
+        scale_reg: float = 1e-4,
+        log_scale_min: float = -5.0,
+        log_scale_max: float = 5.0,
+        w_init: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        scale_init: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        device: Optional[str] = None,
+        verbose: bool = True
+    ):
+        self.N_dim = N_dim
+        self.K_restarts = K_restarts
+        self.n_neighbors = n_neighbors
+        self.metric = metric
+        self.target_metric = target_metric
+        self.target_weight = target_weight
+        self.unknown_label = unknown_label
+        self.epochs = epochs
+        self.lr = lr
+        self.scale_reg = scale_reg
+        self.log_scale_min = log_scale_min
+        self.log_scale_max = log_scale_max
+        self.w_init = w_init
+        self.scale_init = scale_init
+        self.verbose = verbose
+        
+        if device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+        
+        # Атрибуты целевой топологии (заполняются в fit)
+        self.v_ij_ = None
+        self.umap_a_ = None
+        self.umap_b_ = None
+        
+        # Обученные параметры фильтров (заполняются в transform)
+        self.w_opt_ = None
+        self.scales_opt_ = None
+        self.loss_history_ = None
+        self.individual_losses_ = None
 
-    C = torch.as_tensor(C, dtype=torch.float32)
-
-    N_epochs, M_channels, M_channels_2 = C.shape
-    if M_channels != M_channels_2:
-        raise ValueError("C must have shape (N_epochs, M, M).")
-
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    C = C.to(device)
-
-    if verbose:
-        print(f"Building UMAP graph and moving data to {device}...")
-
-    # Строим базовый топологический граф по данным
-    v_ij, umap_a, umap_b = get_umap_graph(
-        T_features=T_features,
-        D_matrix=D_matrix,
-        n_neighbors=n_neighbors,
-        metric=metric,
-    )
-    v_ij = v_ij.to(device)
-
-    # =====================================================================
-    # UMAP TARGET SIMPLICIAL SET INTERSECTION (CATEGORICAL & CONTINUOUS)
-    # =====================================================================
-    if labels is not None:
-        if verbose:
-            print(f"Applying supervised topological intersection ({target_metric})...")
-    
-        # Преобразуем labels к numpy для удобства проверки размерности
-        if isinstance(labels, list):
-            labels = np.asarray(labels, dtype=np.float32)
-        elif isinstance(labels, torch.Tensor):
-            labels = labels.cpu().numpy().astype(np.float32)
-        elif not isinstance(labels, np.ndarray):
-            labels = np.asarray(labels, dtype=np.float32)
-    
-        # Проверка размерности меток
-        if labels.ndim == 1:
-            # Одномерные метки: может быть categorical или continuous
-            if target_metric == "categorical":
-                # ---------------------------------------------------------
-                # ВАРИАНТ 1: Категориальные метки (Классификация)
-                # ---------------------------------------------------------
-                if target_weight < 1.0:
-                    far_dist = 2.5 * (1.0 / (1.0 - target_weight))
-                else:
-                    far_dist = 1.0e12
-    
-                labels_t = torch.as_tensor(labels, dtype=torch.float32, device=device)
-                is_unknown = (labels_t == unknown_label)
-                same_class = (labels_t.unsqueeze(1) == labels_t.unsqueeze(0))
-    
-                penalty = torch.ones_like(v_ij)
-                unknown_mask = is_unknown.unsqueeze(1) | is_unknown.unsqueeze(0)
-                penalty[unknown_mask] = np.exp(-1.0)
-                diff_class_mask = (~unknown_mask) & (~same_class)
-                penalty[diff_class_mask] = float(np.exp(-far_dist))
-    
-                v_ij = v_ij * penalty
+    def _combine_distance_matrices(self, D_matrices: List[np.ndarray]) -> torch.Tensor:
+        """
+        Строит базовые графы по матрицам расстояний и объединяет их.
+        """
+        v_ij_combined = None
+        
+        for D in D_matrices:
+            v_ij, a, b = get_umap_graph(
+                D_matrix=D, 
+                n_neighbors=self.n_neighbors,
+                metric=self.metric
+            )
+            self.umap_a_, self.umap_b_ = a, b 
+            v_ij = v_ij.to(self.device)
+            
+            if v_ij_combined is None:
+                v_ij_combined = v_ij
             else:
-                # Одномерные, но метрика не categorical (например, l1, l2)
-                labels_2d = labels.reshape(-1, 1)
+                v_ij_combined = v_ij_combined + v_ij - (v_ij_combined * v_ij)
+                
+        return v_ij_combined
+
+    def fit(self, D_matrices: List[np.ndarray], y: Optional[Union[np.ndarray, list]] = None):
+        """
+        Формирует топологическую структуру данных.
+        
+        :param D_matrices: Список матриц попарных расстояний (N_epochs, N_epochs).
+        :param y: Внешние метки (категориальные или непрерывные) формы (N_epochs,).
+        """
+        if not D_matrices:
+            raise ValueError("D_matrices must be provided to build the topology.")
+
+        if self.verbose:
+            print(f"Building combined UMAP graph from {len(D_matrices)} distance matrices...")
+            
+        v_ij = self._combine_distance_matrices(D_matrices)
+
+        # UMAP TARGET SIMPLICIAL SET INTERSECTION
+        if y is not None:
+            if self.verbose:
+                print(f"Applying supervised topological intersection ({self.target_metric})...")
+            
+            labels = np.asarray(y, dtype=np.float32)
+            
+            if labels.ndim == 1:
+                if self.target_metric == "categorical":
+                    if self.target_weight < 1.0:
+                        far_dist = 2.5 * (1.0 / (1.0 - self.target_weight))
+                    else:
+                        far_dist = 1.0e12
+        
+                    labels_t = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
+                    is_unknown = (labels_t == self.unknown_label)
+                    same_class = (labels_t.unsqueeze(1) == labels_t.unsqueeze(0))
+        
+                    penalty = torch.ones_like(v_ij)
+                    unknown_mask = is_unknown.unsqueeze(1) | is_unknown.unsqueeze(0)
+                    penalty[unknown_mask] = np.exp(-1.0)
+                    diff_class_mask = (~unknown_mask) & (~same_class)
+                    penalty[diff_class_mask] = float(np.exp(-far_dist))
+        
+                    v_ij = v_ij * penalty
+                else:
+                    labels_2d = labels.reshape(-1, 1)
+                    target_v_ij, _, _ = get_umap_graph(
+                        T_features=labels_2d,
+                        n_neighbors=self.n_neighbors,
+                        metric=self.target_metric
+                    )
+                    target_v_ij = target_v_ij.to(self.device)
+        
+                    eps = 1e-8
+                    if self.target_weight < 0.5:
+                        power = self.target_weight / (1.0 - self.target_weight)
+                        v_ij = v_ij * torch.pow(target_v_ij.clamp_min(eps), power)
+                    else:
+                        power = 0.0 if self.target_weight == 1.0 else (1.0 - self.target_weight) / self.target_weight
+                        v_ij = torch.pow(v_ij.clamp_min(eps), power) * target_v_ij
+                        
+            elif labels.ndim == 2:
                 target_v_ij, _, _ = get_umap_graph(
-                    T_features=labels_2d,
-                    n_neighbors=n_neighbors,
-                    metric=target_metric
+                    T_features=labels,
+                    n_neighbors=self.n_neighbors,
+                    metric=self.target_metric
                 )
-                target_v_ij = target_v_ij.to(device)
-    
-                # general_simplicial_set_intersection из оригинального UMAP
+                target_v_ij = target_v_ij.to(self.device)
+        
                 eps = 1e-8
-                if target_weight < 0.5:
-                    power = target_weight / (1.0 - target_weight)
+                if self.target_weight < 0.5:
+                    power = self.target_weight / (1.0 - self.target_weight)
                     v_ij = v_ij * torch.pow(target_v_ij.clamp_min(eps), power)
                 else:
-                    if target_weight == 1.0:
-                        power = 0.0  # избегаем деления на 0
-                    else:
-                        power = (1.0 - target_weight) / target_weight
+                    power = 0.0 if self.target_weight == 1.0 else (1.0 - self.target_weight) / self.target_weight
                     v_ij = torch.pow(v_ij.clamp_min(eps), power) * target_v_ij
-    
-        elif labels.ndim == 2:
-            # Многомерные метки: строим граф как по обычным признакам, используя target_metric
-            target_v_ij, _, _ = get_umap_graph(
-                T_features=labels,
-                n_neighbors=n_neighbors,
-                metric=target_metric
-            )
-            target_v_ij = target_v_ij.to(device)
-    
-            eps = 1e-8
-            if target_weight < 0.5:
-                power = target_weight / (1.0 - target_weight)
-                v_ij = v_ij * torch.pow(target_v_ij.clamp_min(eps), power)
             else:
-                if target_weight == 1.0:
-                    power = 0.0
-                else:
-                    power = (1.0 - target_weight) / target_weight
-                v_ij = torch.pow(v_ij.clamp_min(eps), power) * target_v_ij
-        else:
-            raise ValueError("Labels must be 1D or 2D array.")
-    
-        # ---------------------------------------------------------
-        # ВОССТАНОВЛЕНИЕ ЛОКАЛЬНОЙ СВЯЗНОСТИ (reset_local_connectivity)
-        # ---------------------------------------------------------
-        row_max = v_ij.max(dim=1, keepdim=True).values.clamp_min(1e-8)
-        v_ij = v_ij / row_max
-        v_ij_t = v_ij.t()
-        v_ij = v_ij + v_ij_t - (v_ij * v_ij_t)
-    # =====================================================================
+                raise ValueError("Labels must be 1D or 2D array.")
+        
+            # Восстановление локальной связности
+            row_max = v_ij.max(dim=1, keepdim=True).values.clamp_min(1e-8)
+            v_ij = v_ij / row_max
+            v_ij_t = v_ij.t()
+            v_ij = v_ij + v_ij_t - (v_ij * v_ij_t)
 
-    model = TopologicalFilterBatch(
-        M=M_channels,
-        N_dim=N_dim,
-        K_restarts=K_restarts,
-        w_init=w_init,
-        scale_init=scale_init,
-    ).to(device)
+        self.v_ij_ = v_ij
+        return self
 
-    # Explicitly exclude log_scale from AdamW weight decay.
-    # Its regularization is controlled by scale_reg.
-    optimizer = optim.AdamW(
-        [
-            {"params": [model.w], "weight_decay": 1e-2},
-            {"params": [model.log_scale], "weight_decay": 0.0},
-        ],
-        lr=lr,
-    )
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        patience=10,
-        factor=0.5,
-    )
+    def transform(self, C: Union[np.ndarray, torch.Tensor]) -> np.ndarray:
+        """
+        Ищет пространственные фильтры для матриц ковариации на основе графа из fit().
+        
+        :param C: Нефильтрованные матрицы ковариации, форма (N_epochs, M_channels, M_channels).
+        :return: Оптимальная проекция (N_epochs, N_dim)
+        """
+        if self.v_ij_ is None:
+            raise RuntimeError("Topology not built. Call .fit() with D_matrices first.")
 
-    loss_history = torch.zeros(
-        epochs,
-        K_restarts,
-        dtype=torch.float32,
-    )
+        C_tensor = torch.as_tensor(C, dtype=torch.float32).to(self.device)
+        N_epochs, M_channels, M_channels_2 = C_tensor.shape
+        
+        if M_channels != M_channels_2:
+            raise ValueError("C must have shape (N_epochs, M, M).")
 
-    pbar = tqdm(
-        range(epochs),
-        disable=not verbose,
-        desc="Optimizing Filters",
-    )
+        model = TopologicalFilterBatch(
+            M=M_channels,
+            N_dim=self.N_dim,
+            K_restarts=self.K_restarts,
+            w_init=self.w_init,
+            scale_init=self.scale_init,
+        ).to(self.device)
 
-    for epoch in pbar:
-        optimizer.zero_grad()
-
-        y = model(C)
-        losses = umap_cross_entropy_loss(
-            y,
-            v_ij,
-            umap_a,
-            umap_b,
+        optimizer = optim.AdamW(
+            [
+                {"params": [model.w], "weight_decay": 1e-2},
+                {"params": [model.log_scale], "weight_decay": 0.0},
+            ],
+            lr=self.lr,
+        )
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            patience=10,
+            factor=0.5,
         )
 
-        scale_penalty = _scale_regularization_per_restart(
-            model.log_scale,
-            scale_reg,
-        )
-        objective = losses + scale_penalty
-        total_objective = objective.mean()
+        loss_history = torch.zeros(self.epochs, self.K_restarts, dtype=torch.float32)
 
-        total_objective.backward()
-        optimizer.step()
+        pbar = tqdm(range(self.epochs), disable=not self.verbose, desc="Finding Spatial Filters")
+
+        for epoch in pbar:
+            optimizer.zero_grad()
+
+            y_pred = model(C_tensor)
+            losses = umap_cross_entropy_loss(
+                y_pred,
+                self.v_ij_,
+                self.umap_a_,
+                self.umap_b_,
+            )
+
+            scale_penalty = _scale_regularization_per_restart(
+                model.log_scale,
+                self.scale_reg,
+            )
+            objective = losses + scale_penalty
+            total_objective = objective.mean()
+
+            total_objective.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                w_norms = torch.linalg.vector_norm(model.w, dim=2, keepdim=True)
+                model.w.div_(w_norms.clamp_min(1e-8))
+                model.log_scale.clamp_(min=self.log_scale_min, max=self.log_scale_max)
+
+            loss_history[epoch] = losses.detach().cpu()
+            current_loss = losses.mean().item()
+            scheduler.step(total_objective.item())
+
+            pbar.set_postfix(
+                mean_umap_loss=f"{current_loss:.4f}",
+                mean_scale=f"{model.scale.mean().item():.3f}",
+            )
 
         with torch.no_grad():
-            # This fixes an otherwise unidentifiable spatial-vector norm.
-            # It does not set the embedding-coordinate scale.
-            w_norms = torch.linalg.vector_norm(
-                model.w,
-                dim=2,
-                keepdim=True,
-            )
-            model.w.div_(w_norms.clamp_min(1e-8))
+            final_y = model(C_tensor)
+            final_losses = umap_cross_entropy_loss(
+                final_y,
+                self.v_ij_,
+                self.umap_a_,
+                self.umap_b_,
+            ).detach().cpu()
 
-            model.log_scale.clamp_(
-                min=log_scale_min,
-                max=log_scale_max,
-            )
+            w_final = model.w.detach().cpu().clone()
+            scales_final = model.scale.detach().cpu().clone()
+            individual_losses = torch.zeros(self.K_restarts, self.N_dim, dtype=torch.float32)
 
-        loss_history[epoch] = losses.detach().cpu()
-
-        current_loss = losses.mean().item()
-        scheduler.step(total_objective.item())
-
-        pbar.set_postfix(
-            mean_umap_loss=f"{current_loss:.4f}",
-            mean_scale=f"{model.scale.mean().item():.3f}",
-        )
-
-    with torch.no_grad():
-        final_y = model(C)
-        final_losses = umap_cross_entropy_loss(
-            final_y,
-            v_ij,
-            umap_a,
-            umap_b,
-        ).detach().cpu()
-
-        w_final = model.w.detach().cpu().clone()
-        scales_final = model.scale.detach().cpu().clone()
-
-        individual_losses = torch.zeros(
-            K_restarts,
-            N_dim,
-            dtype=torch.float32,
-        )
-
-        for k in range(K_restarts):
-            for d in range(N_dim):
-                y_1d = final_y[k:k + 1, :, d:d + 1]
-                individual_losses[k, d] = (
-                    umap_cross_entropy_loss(
-                        y_1d,
-                        v_ij,
-                        umap_a,
-                        umap_b,
+            for k in range(self.K_restarts):
+                for d in range(self.N_dim):
+                    y_1d = final_y[k:k + 1, :, d:d + 1]
+                    individual_losses[k, d] = umap_cross_entropy_loss(
+                        y_1d, self.v_ij_, self.umap_a_, self.umap_b_
                     ).item()
-                )
 
-            sorted_dims = torch.argsort(
-                individual_losses[k]
-            )
+                sorted_dims = torch.argsort(individual_losses[k])
+                individual_losses[k] = individual_losses[k, sorted_dims]
+                w_final[k] = w_final[k, sorted_dims]
+                scales_final[k] = scales_final[k, sorted_dims]
 
-            individual_losses[k] = (
-                individual_losses[k, sorted_dims]
-            )
-            w_final[k] = w_final[k, sorted_dims]
-            scales_final[k] = scales_final[k, sorted_dims]
+            sorted_restarts = torch.argsort(final_losses)
 
-        sorted_restarts = torch.argsort(final_losses)
+            # Сохраняем все варианты, отсортированные по качеству
+            self.w_opt_ = w_final[sorted_restarts].numpy()
+            self.scales_opt_ = scales_final[sorted_restarts].numpy()
+            self.loss_history_ = loss_history[:, sorted_restarts].numpy()
+            self.individual_losses_ = individual_losses[sorted_restarts].numpy()
+            
+            # Извлекаем признаки для самого успешного рестарта (k=0 после сортировки)
+            best_y = final_y[sorted_restarts[0]].cpu().numpy()
 
-        w_opt = w_final[sorted_restarts].numpy()
-        scales_opt = scales_final[sorted_restarts].numpy()
-        final_losses_sorted = (
-            final_losses[sorted_restarts].numpy()
-        )
-        loss_history_sorted = (
-            loss_history[:, sorted_restarts].numpy()
-        )
-        individual_losses_sorted = (
-            individual_losses[sorted_restarts].numpy()
-        )
-
-    return (
-        w_opt,
-        scales_opt,
-        final_losses_sorted,
-        loss_history_sorted,
-        individual_losses_sorted,
-    )
+        # Возвращаем спроецированные данные, фильтры доступны через self.w_opt_
+        return best_y
