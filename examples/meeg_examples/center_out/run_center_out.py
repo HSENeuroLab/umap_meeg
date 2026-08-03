@@ -212,7 +212,7 @@ if label_mode == 'categorical_binary':
 # -----------------------------------------------------------------
 # 5. РИМАНОВА ДЕФЛЯЦИЯ С ИСПОЛЬЗОВАНИЕМ НОВОГО КЛАССА
 # -----------------------------------------------------------------
-n_iters = 3
+n_iters = 1
 N_dim = 3
 n_neighbors = 30
 
@@ -228,6 +228,7 @@ Q_acc = np.eye(n_components_ssd)
 # =================================================================
 # ШАГ 1: ОБУЧЕНИЕ ТОПОЛОГИИ ПО МУЛЬТИСПЕКТРАЛЬНЫМ РАССТОЯНИЯМ
 # =================================================================
+from topological_spatial_filter import TopologicalSpatialFilter 
 print("\nОбучение целевой топологии на множестве узких диапазонов...")
 tsf = TopologicalSpatialFilter(
     N_dim=N_dim,
@@ -241,7 +242,167 @@ tsf = TopologicalSpatialFilter(
 )
 tsf.fit(D_matrices=D_matrices, y=labels)
 
+# %%
+import matplotlib.pyplot as plt
+import numpy as np
 
+kk = 6
+# Пример для 1-го и 99-го процентиля
+vmin_val = np.percentile(D_matrices[kk], 0.1)
+vmax_val = np.percentile(D_matrices[kk], 1)
+
+plt.imshow(D_matrices[kk], vmin=vmin_val, vmax=vmax_val)
+plt.colorbar()
+plt.show()
+
+# %%
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Переносим матрицу на CPU и конвертируем в numpy (если она torch.Tensor)
+if hasattr(tsf.v_ij_, 'cpu'):
+    v_ij_np = tsf.v_ij_.cpu().numpy()
+else:
+    v_ij_np = tsf.v_ij_
+
+vmin_val = np.percentile(v_ij_np, 5)
+vmax_val = np.percentile(v_ij_np, 95)
+
+fig, ax = plt.subplots(figsize=(12, 12))
+im = ax.imshow(v_ij_np, vmin=vmin_val, vmax=vmax_val, cmap='viridis')
+plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+# 1. Вычисляем границы условий
+n_windows_per_trial = len(window_times)
+cond_boundaries = [0]
+current_cond = trial_cond_labels[0]
+unique_conditions = [current_cond]
+
+for i, cond in enumerate(trial_cond_labels):
+    if cond != current_cond:
+        # Умножаем индекс трайла на количество окон в трайле
+        cond_boundaries.append(i * n_windows_per_trial)
+        current_cond = cond
+        unique_conditions.append(cond)
+        
+# Добавляем конец матрицы
+cond_boundaries.append(len(trial_cond_labels) * n_windows_per_trial)
+
+# 2. Отрисовываем сетку для условий
+for i in range(len(unique_conditions)):
+    b_start = cond_boundaries[i]
+    b_end = cond_boundaries[i+1]
+    
+    # Линии сетки (только внутренние границы)
+    if i < len(unique_conditions) - 1:
+        ax.axhline(b_end, color='red', linewidth=2, linestyle='--', alpha=0.8)
+        ax.axvline(b_end, color='red', linewidth=2, linestyle='--', alpha=0.8)
+    
+    # Подписи осей
+    mid = (b_start + b_end) / 2
+    
+    # Подписи сверху
+    ax.text(mid, -50, unique_conditions[i], color='red', 
+            fontsize=16, ha='center', va='bottom', fontweight='bold')
+    # Подписи слева
+    ax.text(-50, mid, unique_conditions[i], color='red', 
+            fontsize=16, ha='right', va='center', fontweight='bold', rotation=90)
+
+# Убираем стандартные тики, так как они не несут смысла (там индексы окон)
+ax.set_xticks([])
+ax.set_yticks([])
+
+ax.set_title("Мультиспектральный топологический граф (Разметка условий)", fontsize=18, pad=30)
+plt.show()
+
+# %%
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Переносим матрицу в numpy
+if hasattr(tsf.v_ij_, 'cpu'):
+    v_ij_np = tsf.v_ij_.cpu().numpy()
+else:
+    v_ij_np = tsf.v_ij_
+
+vmin_val = np.percentile(v_ij_np, 5)
+vmax_val = np.percentile(v_ij_np, 95)
+
+# --- РАСЧЕТ ГРАНИЦ ---
+n_win_per_trial = len(window_times)
+# Индекс окна, на которое выпадает event_time (0.0 сек)
+task_start_win = np.argmax(np.array(window_times) >= event_time)
+
+# Считаем количество окон на каждое условие
+trials_per_cond = [len(epochs_all[c]) for c in conditions]
+cond_win_counts = [n * n_win_per_trial for n in trials_per_cond]
+cond_boundaries = np.insert(np.cumsum(cond_win_counts), 0, 0)
+
+# ==========================================
+# 1. ГЛОБАЛЬНЫЙ ГРАФИК (УСЛОВИЯ + ТРАЙЛЫ)
+# ==========================================
+fig, ax = plt.subplots(figsize=(12, 12))
+im = ax.imshow(v_ij_np, vmin=vmin_val, vmax=vmax_val, cmap='viridis')
+plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+# Тонкая сетка для ТРАЙЛОВ (полупрозрачная)
+for i in range(1, len(labels) // n_win_per_trial):
+    trial_bound = i * n_win_per_trial
+    ax.axhline(trial_bound, color='white', linewidth=0.3, alpha=1)
+    ax.axvline(trial_bound, color='white', linewidth=0.3, alpha=1)
+
+# Толстая сетка для УСЛОВИЙ
+for i in range(len(conditions)):
+    b_start = cond_boundaries[i]
+    b_end = cond_boundaries[i+1]
+    
+    if i < len(conditions) - 1:
+        ax.axhline(b_end, color='red', linewidth=2, linestyle='-', alpha=0.8)
+        ax.axvline(b_end, color='red', linewidth=2, linestyle='-', alpha=0.8)
+    
+    # Подписи
+    mid = (b_start + b_end) / 2
+    ax.text(mid, -30, conditions[i], color='red', fontsize=14, ha='center', va='bottom', fontweight='bold')
+    ax.text(-30, mid, conditions[i], color='red', fontsize=14, ha='right', va='center', fontweight='bold', rotation=90)
+
+ax.set_xticks([])
+ax.set_yticks([])
+ax.set_title("Полная матрица (Сетка: белая - трайлы, красная - условия)", fontsize=16, pad=20)
+plt.show()
+
+# ==========================================
+# 2. ЗУМ: ПЕРВЫЕ НЕСКОЛЬКО ТРАЙЛОВ 
+# ==========================================
+zoom_trials = 6  # Сколько трайлов вырезать для зума
+zoom_size = zoom_trials * n_win_per_trial
+
+fig, ax = plt.subplots(figsize=(8, 8))
+im = ax.imshow(v_ij_np[:zoom_size, :zoom_size], vmin=vmin_val, vmax=vmax_val, cmap='viridis')
+
+# Разметка внутри увеличенного куска
+for i in range(zoom_trials):
+    tb = i * n_win_per_trial # Граница трайла
+    
+    if i > 0:
+        ax.axhline(tb, color='white', linewidth=2, linestyle='-')
+        ax.axvline(tb, color='white', linewidth=2, linestyle='-')
+    
+    # Граница стимула (baseline -> task)
+    stim_bound = tb + task_start_win
+    ax.axhline(stim_bound, color='red', linewidth=1.5, linestyle='--')
+    ax.axvline(stim_bound, color='red', linewidth=1.5, linestyle='--')
+    
+    # Добавим подписи прямо на график для наглядности (только для первого трайла)
+    if i == 0:
+        ax.text(stim_bound / 2, -2, 'Base', color='red', ha='center', va='bottom')
+        ax.text(stim_bound + (n_win_per_trial - task_start_win)/2, -2, 'Task', color='red', ha='center', va='bottom')
+
+ax.set_xticks([])
+ax.set_yticks([])
+ax.set_title(f"ЗУМ (Первые {zoom_trials} трайлов)\nСплошная белая - граница трайла | Пунктир - 0.0 сек (движение)", fontsize=14, pad=20)
+plt.show()
+
+# %%
 # =================================================================
 # ШАГ 2: ЦИКЛ ДЕФЛЯЦИИ ДЛЯ ЦЕЛЕВЫХ МАТРИЦ
 # =================================================================
