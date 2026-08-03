@@ -35,3 +35,7 @@ dist
 .coverage
 .coverage.*
 .coverage.xml
+
+#
+*.fif
+**/*.fif

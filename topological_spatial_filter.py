@@ -397,70 +397,87 @@ def fit_filters(
     if labels is not None:
         if verbose:
             print(f"Applying supervised topological intersection ({target_metric})...")
-        
-        if target_metric == "categorical":
-            # ---------------------------------------------------------
-            # ВАРИАНТ 1: Категориальные метки (Классификация)
-            # ---------------------------------------------------------
-            if target_weight < 1.0:
-                far_dist = 2.5 * (1.0 / (1.0 - target_weight))
+    
+        # Преобразуем labels к numpy для удобства проверки размерности
+        if isinstance(labels, list):
+            labels = np.asarray(labels, dtype=np.float32)
+        elif isinstance(labels, torch.Tensor):
+            labels = labels.cpu().numpy().astype(np.float32)
+        elif not isinstance(labels, np.ndarray):
+            labels = np.asarray(labels, dtype=np.float32)
+    
+        # Проверка размерности меток
+        if labels.ndim == 1:
+            # Одномерные метки: может быть categorical или continuous
+            if target_metric == "categorical":
+                # ---------------------------------------------------------
+                # ВАРИАНТ 1: Категориальные метки (Классификация)
+                # ---------------------------------------------------------
+                if target_weight < 1.0:
+                    far_dist = 2.5 * (1.0 / (1.0 - target_weight))
+                else:
+                    far_dist = 1.0e12
+    
+                labels_t = torch.as_tensor(labels, dtype=torch.float32, device=device)
+                is_unknown = (labels_t == unknown_label)
+                same_class = (labels_t.unsqueeze(1) == labels_t.unsqueeze(0))
+    
+                penalty = torch.ones_like(v_ij)
+                unknown_mask = is_unknown.unsqueeze(1) | is_unknown.unsqueeze(0)
+                penalty[unknown_mask] = np.exp(-1.0)
+                diff_class_mask = (~unknown_mask) & (~same_class)
+                penalty[diff_class_mask] = float(np.exp(-far_dist))
+    
+                v_ij = v_ij * penalty
             else:
-                far_dist = 1.0e12
-
-            labels_t = torch.as_tensor(labels, dtype=torch.float32, device=device)
-            is_unknown = (labels_t == unknown_label)
-            same_class = (labels_t.unsqueeze(1) == labels_t.unsqueeze(0))
-            
-            # Матрица штрафов. По умолчанию unknown_dist = 1.0 в UMAP
-            penalty = torch.ones_like(v_ij)
-            
-            # Если хотя бы одна метка неизвестна, штраф exp(-1.0)
-            unknown_mask = is_unknown.unsqueeze(1) | is_unknown.unsqueeze(0)
-            penalty[unknown_mask] = np.exp(-1.0)
-            
-            # Если метки известны, но разные, штраф exp(-far_dist)
-            diff_class_mask = (~unknown_mask) & (~same_class)
-            penalty[diff_class_mask] = float(np.exp(-far_dist))
-            
-            v_ij = v_ij * penalty
-
-        else:
-            # ---------------------------------------------------------
-            # ВАРИАНТ 2: Непрерывные метки (Регрессия)
-            # ---------------------------------------------------------
-            labels_np = np.asarray(labels, dtype=np.float32).reshape(-1, 1)
-            
-            # Строим отдельный UMAP граф по значениям целевой переменной
+                # Одномерные, но метрика не categorical (например, l1, l2)
+                labels_2d = labels.reshape(-1, 1)
+                target_v_ij, _, _ = get_umap_graph(
+                    T_features=labels_2d,
+                    n_neighbors=n_neighbors,
+                    metric=target_metric
+                )
+                target_v_ij = target_v_ij.to(device)
+    
+                # general_simplicial_set_intersection из оригинального UMAP
+                eps = 1e-8
+                if target_weight < 0.5:
+                    power = target_weight / (1.0 - target_weight)
+                    v_ij = v_ij * torch.pow(target_v_ij.clamp_min(eps), power)
+                else:
+                    if target_weight == 1.0:
+                        power = 0.0  # избегаем деления на 0
+                    else:
+                        power = (1.0 - target_weight) / target_weight
+                    v_ij = torch.pow(v_ij.clamp_min(eps), power) * target_v_ij
+    
+        elif labels.ndim == 2:
+            # Многомерные метки: строим граф как по обычным признакам, используя target_metric
             target_v_ij, _, _ = get_umap_graph(
-                T_features=labels_np,
+                T_features=labels,
                 n_neighbors=n_neighbors,
                 metric=target_metric
             )
             target_v_ij = target_v_ij.to(device)
-            
-            # general_simplicial_set_intersection из оригинального UMAP
-            # Реализация смешивания весов в зависимости от target_weight
+    
             eps = 1e-8
             if target_weight < 0.5:
                 power = target_weight / (1.0 - target_weight)
                 v_ij = v_ij * torch.pow(target_v_ij.clamp_min(eps), power)
             else:
                 if target_weight == 1.0:
-                    power = 0.0 # Предотвращаем деление на 0
+                    power = 0.0
                 else:
                     power = (1.0 - target_weight) / target_weight
                 v_ij = torch.pow(v_ij.clamp_min(eps), power) * target_v_ij
-
+        else:
+            raise ValueError("Labels must be 1D or 2D array.")
+    
         # ---------------------------------------------------------
         # ВОССТАНОВЛЕНИЕ ЛОКАЛЬНОЙ СВЯЗНОСТИ (reset_local_connectivity)
         # ---------------------------------------------------------
-        # Нормализуем каждую строку по максимальному значению, 
-        # чтобы гарантировать наличие хотя бы одного 1-симплекса с весом 1.0
         row_max = v_ij.max(dim=1, keepdim=True).values.clamp_min(1e-8)
         v_ij = v_ij / row_max
-        
-        # Применяем нечеткое объединение (fuzzy union: a + b - a * b) 
-        # для симметризации графа
         v_ij_t = v_ij.t()
         v_ij = v_ij + v_ij_t - (v_ij * v_ij_t)
     # =====================================================================
