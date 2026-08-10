@@ -8,6 +8,7 @@ Created on Wed Oct 22 17:07:11 2025
 import mne
 import numpy as np
 import matplotlib.pyplot as plt
+import umap
 
 from scipy.signal import butter, filtfilt
 from scipy.linalg import eigh
@@ -263,7 +264,7 @@ print(f"Эпохи спроецированы в SSD-пространство, �
 # %%
 covmats_band = Covariances(estimator='oas').fit_transform(X_windows_band)
 covmats_ssd = Covariances(estimator='oas').fit_transform(X_windows_ssd_proj)
-covmats = Covariances(estimator='oas').fit_transform(X_windows_band)
+covmats = Covariances(estimator='oas').fit_transform(X_windows_unfilt)
 
 # %%
 print("Отбеливание ковариационных матриц по среднему арифметическому...")
@@ -519,24 +520,28 @@ from matplotlib.gridspec import GridSpec
 import matplotlib as mpl
 import numpy as np
 
-# Функция для настройки осей UMAP: оставляет сетку, но убирает цифры
 def format_umap_axes(ax):
     ax.set_xticklabels([])
     ax.set_yticklabels([])
     ax.tick_params(axis='both', which='both', length=0)
     ax.grid(True, linestyle='--', alpha=0.5, zorder=0)
 
-comp_idx = 8  # выберите нужный компонент
+comp_idx = 0
 
 w_comp = found_filters[comp_idx]
 a_comp = found_patterns[comp_idx]
 
-A_pattern = a_comp     # Паттерн (Forward Model)
-W_sensor = w_comp      # Фильтр (Inverse Model)
+W_sensor = w_comp      
+A_pattern = a_comp    
 
 p_vals = []
-for c_i in covmats:
-    p_vals.append(w_comp.T @ c_i @ w_comp)
+for c_i in covmats_band:
+    p_vals.append(np.log(w_comp.T @ c_i @ w_comp))
+
+plt.plot(p_vals)
+
+# %%
+
 
 # UMAP дефлированного пространства для данного этапа
 umap_undefl = umap_coords_history[0]
@@ -624,4 +629,7 @@ ax_env.grid(True, axis='y', linestyle=':', alpha=0.6, zorder=0)
 plt.suptitle(f'Компонента {comp_idx+1}', fontsize=16)
 plt.tight_layout()
 plt.show()
+
+# %%
+
 
