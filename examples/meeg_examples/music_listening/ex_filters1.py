@@ -13,7 +13,6 @@ import umap
 from scipy.signal import butter, filtfilt
 from scipy.linalg import eigh
 from scipy.linalg import inv, null_space
-from pyriemann.utils.base import invsqrtm
 
 import sys
 import os
@@ -22,6 +21,7 @@ lib_directory = os.path.abspath("C:/Users/ansbel/Documents/GitHub/pyRiemann")
 if lib_directory not in sys.path:
     sys.path.insert(0, lib_directory)
 from pyriemann.estimation import Covariances
+from pyriemann.utils.base import invsqrtm
 
 from topological_spatial_filter import fit_filters
 
@@ -264,7 +264,6 @@ covmats_band = Covariances().fit_transform(X_windows_band)
 covmats_ssd = Covariances().fit_transform(X_windows_ssd_proj)
 covmats = Covariances().fit_transform(X_windows_unfilt)
 
-# %%
 print("Отбеливание ковариационных матриц по среднему арифметическому...")
 C_avg = np.mean(covmats_ssd, axis=0)                     
 C_avg_invsqrt = invsqrtm(C_avg)                       
@@ -404,7 +403,7 @@ plt.show()
 from topological_spatial_filter import fit_filters
 
 n_iters = 3
-N_dim = 2
+N_dim = 3
 n_neighbors = 20
 
 found_filters = []
@@ -524,7 +523,7 @@ def format_umap_axes(ax):
     ax.tick_params(axis='both', which='both', length=0)
     ax.grid(True, linestyle='--', alpha=0.5, zorder=0)
 
-comp_idx = 5
+comp_idx = 0
 
 w_comp = found_filters[comp_idx]
 a_comp = found_patterns[comp_idx]
