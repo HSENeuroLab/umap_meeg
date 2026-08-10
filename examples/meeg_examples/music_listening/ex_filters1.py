@@ -267,16 +267,16 @@ covmats = Covariances(estimator='oas').fit_transform(X_windows_band)
 
 # %%
 print("Отбеливание ковариационных матриц по среднему арифметическому...")
-C_avg = np.mean(covmats, axis=0)                     
+C_avg = np.mean(covmats_ssd, axis=0)                     
 C_avg_invsqrt = invsqrtm(C_avg)                       
 C_avg_sqrt = np.linalg.inv(C_avg_invsqrt)             
-covmats_white = C_avg_invsqrt @ covmats @ C_avg_invsqrt
+covmats_white = C_avg_invsqrt @ covmats_ssd @ C_avg_invsqrt
 
 # %%
 from pyriemann.geometry.distance import pairwise_distance
 
 # dist_matrix_init = pairwise_distance(covmats_white, metric='euclid')
-dist_matrix_init = pairwise_distance(covmats, metric='riemann')
+dist_matrix_init = pairwise_distance(covmats_white, metric='riemann')
 N_neig = 20
 
 # %%
@@ -404,78 +404,79 @@ plt.show()
 # %%
 from topological_spatial_filter import fit_filters
 
-current_dim = covmats_white.shape[1]          # исходная размерность после SSD
-covmats_current = covmats_white.copy()
-# current_dim = covmats.shape[1]          # исходная размерность после SSD
-# covmats_current = covmats.copy()
+n_iters = 3
+N_dim = 4
+n_neighbors = 30
 
-filters_full = []        
-patterns_full = []      
-losses = []
+found_filters = []
+found_patterns = []
 umap_coords_history = []
-power_history = []
-dims_history = []
-scales_history = []
 
-B_cumulative = np.eye(current_dim)
-N_epochs = covmats_white.copy().shape[0]
+C_current = covmats_white.copy()
+A_ssd_accumulated = []
+Q_acc = np.eye(n_components_ssd)
 
-dist_matrix_current = dist_matrix_init.copy()
-distances_history = [dist_matrix_current]
+dist_matrix = dist_matrix_init.copy()
+for it in range(n_iters):
+    print(f"\n  -> Итерация дефляции {it + 1}/{n_iters} ...")
+    
+    # dist_matrix = pairwise_distance(C_current, metric='riemann')
+    # N = dist_matrix.shape[0]
+    # shuffled_indices = np.random.permutation(N)
+    # dist_matrix = dist_matrix[shuffled_indices, :][:, shuffled_indices]
+    # random_points = np.random.rand(N, 10)    
+    # Строим честную псевдоматрицу расстояний
+    # dist_matrix = pairwise_distance(random_points, metric='euclid')
+    # dist_matrix = np.zeros(N)
 
-N_NEIG = 20
-N = 10
-for comp in range(N):
-    print(f"\n=== Компонент {comp+1} (текущая размерность {current_dim}) ===")
+    print("     Вычисление UMAP для текущего подпространства...")
+    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, 
+                        metric='precomputed')
+    umap_coords = reducer.fit_transform(dist_matrix)
+    umap_coords_history.append(umap_coords)
 
-    # 1. поиск фильтра w
-    w_opt, scales_opt, final_losses, loss_history, ind_losses = fit_filters(
-        C=covmats_current,
-        D_matrix=dist_matrix_current,
-        N_dim=2,
-        K_restarts=1,
-        n_neighbors=N_NEIG,
-        epochs=500,
-        lr=0.05
+    print("     Оптимизация фильтров...")
+    w_opt, _, _, _, _ = fit_filters(
+        C=C_current, 
+        D_matrix=dist_matrix, 
+        N_dim=N_dim,             
+        K_restarts=1, 
+        n_neighbors=n_neighbors, 
+        epochs=500, 
+        lr=0.05, 
+        verbose=True
     )
-    print(ind_losses)
-    scales_history.append(scales_opt)
-    losses.append(loss_history)
-    w_current = w_opt[0, 0, :]
-    a_current = np.mean(covmats_current,0) @ w_current
+    
+    W_cur = w_opt[0].T 
+    # W_cur = np.random.rand(W_cur.shape[0],W_cur.shape[1])
+    C_mean_current = np.mean(C_current, axis=0)
+    A_cur = C_mean_current @ W_cur   
+    
+    W_ssd_white = Q_acc @ W_cur      
+    A_ssd_white = Q_acc @ A_cur    
 
-    p_comp = np.zeros(N_epochs)
-    for i in range(N_epochs):
-        p_comp[i] = np.log(w_current.T @ covmats_current[i] @ w_current)
-
-    power_history.append(p_comp)
-
-    filters_full.append(B_cumulative @ w_current)
-    patterns_full.append(B_cumulative @ a_current)
-
-    umap_step = umap.UMAP(n_components=2, n_neighbors=N_NEIG, metric='precomputed')
-    coords = umap_step.fit_transform(dist_matrix_current)
-
-    umap_coords_history.append(coords)
-    dims_history.append(current_dim)
-
-    if comp < N - 1:
-        Pu = null_space(a_current.reshape(1, -1))
-
-        covmats_new = np.zeros((N_epochs, current_dim-1, current_dim-1))
-        for i in range(N_epochs):
-            c_new = Pu.T @ covmats_current[i] @ Pu
-            covmats_new[i] = c_new + 1e-6 * np.trace(c_new) * np.eye(current_dim - 1)
-
-        B_cumulative = B_cumulative @ Pu
-        current_dim -= 1
-        covmats_current = covmats_new
+    W_ssd_orig = C_avg_invsqrt @ W_ssd_white   
+    A_ssd_orig = C_avg_sqrt @ A_ssd_white      
+    
+    W_global = W_ssd @ W_ssd_orig
+    A_global = A_ssd @ A_ssd_orig
+    
+    for d in range(N_dim):
+        found_filters.append(W_global[:, d])
+        found_patterns.append(A_global[:, d])
+    
+    A_ssd_accumulated.append(A_ssd_white)
         
-        dist_matrix_current = pairwise_distance(covmats_current, metric='riemann')
-        distances_history.append(dist_matrix_current)
-
-    print(f"  Потери: {final_losses[-1]:.4f}")
-
+    if n_iters > 1:
+        A_stacked = np.hstack(A_ssd_accumulated)    
+        Q_acc = null_space(A_stacked.T) 
+    
+        C_current = np.zeros((covmats_white.shape[0], Q_acc.shape[1], Q_acc.shape[1]))
+        for i in range(covmats_white.shape[0]):
+            C_current[i] = Q_acc.T @ covmats_white[i] @ Q_acc
+        
+        dist_matrix = pairwise_distance(C_current, metric='riemann')
+        
 # %%
 aligned_umap_coords = []
 target_coords = None
@@ -514,40 +515,6 @@ umap_coords_history = aligned_umap_coords
 # ==============================================================================
 
 # %%
-# ========== График 1: кривые обучения ==========
-plt.figure(figsize=(10, 6))
-for idx, loss in enumerate(losses):
-    plt.plot(loss, label=f'Компонент {idx+1}')
-plt.xlabel('Эпоха оптимизации')
-plt.ylabel('Loss')
-plt.title('Эволюция функции потерь для каждого фильтра')
-plt.legend()
-plt.grid(True)
-plt.show()
-
-# ========== График 2: UMAP на каждом шаге дефляции ==========
-n_steps = len(umap_coords_history)
-cols = int(np.ceil(n_steps / 2))
-fig, axes = plt.subplots(2, cols, figsize=(4*cols, 8))
-axes = axes.flatten()
-for step, (coords, dim) in enumerate(zip(umap_coords_history, dims_history)):
-    ax = axes[step]
-    if coords is None:
-        ax.text(0.5, 0.5, f'Шаг {step}\n(одномерное пространство)', ha='center', va='center')
-        ax.set_title(f'Шаг {step}')
-    else:
-        p_vals = power_history[step]
-        ax.scatter(coords[:, 0], coords[:, 1], c=p_vals, cmap='plasma', s=10)
-        ax.set_title(f'Шаг {step} (размерность {dim})')
-        ax.grid(True, linestyle='--', alpha=0.6)
-
-for ax in axes[n_steps:]:
-    ax.set_visible(False)
-plt.suptitle('Эволюция топологии касательного пространства по шагам дефляции', fontsize=14)
-plt.tight_layout()
-plt.show()
-
-# %%
 from matplotlib.gridspec import GridSpec
 import matplotlib as mpl
 import numpy as np
@@ -559,19 +526,21 @@ def format_umap_axes(ax):
     ax.tick_params(axis='both', which='both', length=0)
     ax.grid(True, linestyle='--', alpha=0.5, zorder=0)
 
-comp_idx = 0  # выберите нужный компонент
+comp_idx = 8  # выберите нужный компонент
 
-w_comp = filters_full[comp_idx]
-a_comp = patterns_full[comp_idx]
+w_comp = found_filters[comp_idx]
+a_comp = found_patterns[comp_idx]
 
-A_pattern = A_ssd @ C_avg_invsqrt @ a_comp     # Паттерн (Forward Model)
-W_sensor = W_ssd @ C_avg_sqrt @ w_comp      # Фильтр (Inverse Model)
+A_pattern = a_comp     # Паттерн (Forward Model)
+W_sensor = w_comp      # Фильтр (Inverse Model)
 
-p_vals = power_history[comp_idx]
+p_vals = []
+for c_i in covmats:
+    p_vals.append(w_comp.T @ c_i @ w_comp)
 
 # UMAP дефлированного пространства для данного этапа
-umap_undefl = umap_coords_history[comp_idx]
-umap_defl = umap_coords_history[comp_idx+1]
+umap_undefl = umap_coords_history[0]
+umap_defl = umap_coords_history[1]
 
 # Порядок условий: сохраняем порядок появления
 unique_labels_ordered = []
@@ -656,155 +625,3 @@ plt.suptitle(f'Компонента {comp_idx+1}', fontsize=16)
 plt.tight_layout()
 plt.show()
 
-# %%
-from matplotlib.gridspec import GridSpec
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-import numpy as np
-import mne
-
-# Функция для настройки осей UMAP
-def format_umap_axes(ax):
-    ax.set_xticklabels([])
-    ax.set_yticklabels([])
-    ax.tick_params(axis='both', which='both', length=0)
-    ax.grid(True)
-
-# Выбираем компоненты, которые хотим показать (например, первые 3)
-selected_comps = [0, 1, 2, 3, 4, 5]
-N_comps = len(selected_comps)
-
-# Выбираем контрастную палитру для синего фона (теплые яркие цвета)
-umap_cmap = 'plasma' # Альтернативы: 'spring', 'autumn', 'hot'
-
-# Подготовка меток условий
-unique_labels_ordered = []
-for lab in labels:
-    if lab not in unique_labels_ordered:
-        unique_labels_ordered.append(lab)
-
-# Палитра для заливки условий (используем пастельные/контрастные тона)
-cond_cmap = mpl.colormaps['Set3']
-label_to_color = {lab: cond_cmap(i % 12) for i, lab in enumerate(unique_labels_ordered)}
-
-# ========== МАКЕТ ПОСТЕРА ==========
-# Создаем сетку: N строк, 3 колонки (UMAP, Паттерн, Активность)
-fig = plt.figure(figsize=(18, 4.5 * N_comps))
-# Третья колонка (динамика) делается шире остальных
-gs = GridSpec(N_comps, 3, figure=fig, width_ratios=[1, 1, 2.5], wspace=0.2, hspace=0.4)
-
-for row_idx, comp_idx in enumerate(selected_comps):
-    
-    # 1. Данные для текущего компонента
-    a_comp = patterns_full[comp_idx]
-    A_pattern = A_ssd @ a_comp     
-    
-    p_vals = power_history[comp_idx]
-    
-    # UMAP: для 1-й строки это исходное пространство (до дефляции), 
-    # для последующих - пространство после предыдущих дефляций
-    umap_coords = umap_coords_history[comp_idx]
-    # umap_coords = np.zeros_like(umap_coords_history[comp_idx])
-    # umap_coords[:,0] = power_history[comp_idx]
-    # umap_coords[:,1] = power_history[comp_idx+1]
-    
-    # --- КОЛОНКА 1: UMAP Вложение ---
-    ax_umap = fig.add_subplot(gs[row_idx, 0])
-    if umap_coords is not None:
-        sc = ax_umap.scatter(umap_coords[:, 0], umap_coords[:, 1],
-                             c=p_vals, cmap=umap_cmap, s=15, zorder=2, alpha=0.9)
-        cb = plt.colorbar(sc, ax=ax_umap)
-        cb.set_label('log-power', color='white')
-        # title_str = 'Исходное вложение' if comp_idx == 0 else f'Вложение после дефляции {comp_idx}'
-        # ax_umap.set_title(title_str, pad=10)
-        title_str = 'Соответсвующее вложение' if comp_idx == 0 else ''
-        ax_umap.set_title(title_str)
-    else:
-        ax_umap.text(0.5, 0.5, 'Размерность < 2', ha='center', va='center')
-    format_umap_axes(ax_umap)
-
-    # --- КОЛОНКА 2: Паттерн ---
-    ax_patt = fig.add_subplot(gs[row_idx, 1])
-    # MNE топомапы в dark_background могут вести себя специфично.
-    # Если голова рисуется черным, можно настроить параметры outlines.
-    mne.viz.plot_topomap(A_pattern, raw.info, axes=ax_patt, show=False, 
-                         contours=4, sphere=None)
-    ax_patt.set_title(f'Паттерн {comp_idx + 1}', pad=10)
-
-    # --- КОЛОНКА 3: Динамика мощности ---
-    ax_env = fig.add_subplot(gs[row_idx, 2])
-    window_idx = np.arange(len(p_vals))
-    # Линия графика белая, чтобы выделяться на синем фоне
-    ax_env.plot(window_idx, p_vals, lw=1.2, zorder=2)
-
-    xtick_positions = []
-    xtick_labels = []
-    
-    for lab in unique_labels_ordered:
-        mask = (labels == lab)
-        if not np.any(mask):
-            continue
-        changes = np.diff(np.concatenate(([0], mask.astype(int), [0])))
-        starts = np.where(changes == 1)[0]
-        ends = np.where(changes == -1)[0]
-        
-        for s, e in zip(starts, ends):
-            # Заливка фона условия
-            ax_env.axvspan(s, e-1, facecolor=label_to_color[lab], alpha=0.3, zorder=0)
-            # Разделитель
-            ax_env.axvline(x=s, linestyle='--', alpha=0.5, zorder=1)
-            
-            xtick_positions.append(s)
-            xtick_labels.append(lab)
-
-    # Метки только на нижней строке, чтобы не захламлять график
-    if row_idx == N_comps - 1:
-        ax_env.set_xticks(xtick_positions)
-        ax_env.set_xticklabels(xtick_labels, rotation=45, ha='center', fontsize=9)
-        ax_env.set_xlabel('Номер окна')
-    else:
-        ax_env.set_xticks(xtick_positions)
-        ax_env.set_xticklabels([])
-        
-    ax_env.set_ylabel('log-power')
-    
-    ax_env.grid(True, axis='y', linestyle=':', alpha=0.4)
-    ax_env.tick_params(axis='both')
-
-# %%s
-# Предполагаем, что у вас уже есть:
-# raw_ica — исходный Raw после ICA (или любой другой)
-# W_ssd — матрица SSD (n_channels, n_components_ssd)
-# filters_full — массив (n_filters, n_components_ssd)
-
-# 1. Берём только EEG-каналы (чтобы размерность совпадала с W_ssd)
-raw_eeg = raw.copy().pick_types(eeg=True)
-data = raw_eeg.get_data()          # (n_channels, n_samples)
-sfreq = raw_eeg.info['sfreq']
-
-# 2. Матрица проекции из сенсорного пространства в компоненты
-P = W_ssd @ np.array(filters_full).T         # (n_channels, n_filters)
-components = P.T @ data            # (n_filters, n_samples)
-
-# 3. Создаём info для новых каналов
-n_filters = components.shape[0]
-ch_names = [f'Comp_{i+1:02d}' for i in range(n_filters)]
-ch_types = ['eeg'] * n_filters
-info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
-
-# 4. Создаём RawArray
-raw_components = mne.io.RawArray(components, info)
-
-# 5. Переносим аннотации (если нужно)
-new_ann = mne.Annotations(raw_eeg.annotations.onset,raw_eeg.annotations.duration,raw_eeg.annotations.description)
-raw_components.set_annotations(new_ann)
-
-# 6. Визуализация
-raw_components.copy().filter(l_freq=15, h_freq=25).plot(
-    picks='all',  # <--- Ключевое исправление
-    n_channels=n_filters,
-    scalings='auto',
-    title='Выделенные компоненты'
-)
-# Или по отдельности:
-# raw_components.plot_psd()

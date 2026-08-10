@@ -240,8 +240,6 @@ for it in range(n_iters):
     
     W_global = W_ssd @ W_ssd_orig
     A_global = A_ssd @ A_ssd_orig
-    W_global = W_ssd[:,0:4]
-    A_global = A_ssd[:,0:4]
     
     for d in range(N_dim):
         found_filters.append(W_global[:, d])
