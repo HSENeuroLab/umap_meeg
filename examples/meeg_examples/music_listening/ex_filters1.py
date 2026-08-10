@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from scipy.signal import butter, filtfilt
 from scipy.linalg import eigh
 from scipy.linalg import inv, null_space
+from pyriemann.utils.base import invsqrtm
 
 import sys
 import os
@@ -265,10 +266,17 @@ covmats_ssd = Covariances(estimator='oas').fit_transform(X_windows_ssd_proj)
 covmats = Covariances(estimator='oas').fit_transform(X_windows_band)
 
 # %%
+print("Отбеливание ковариационных матриц по среднему арифметическому...")
+C_avg = np.mean(covmats, axis=0)                     
+C_avg_invsqrt = invsqrtm(C_avg)                       
+C_avg_sqrt = np.linalg.inv(C_avg_invsqrt)             
+covmats_white = C_avg_invsqrt @ covmats @ C_avg_invsqrt
+
+# %%
 from pyriemann.geometry.distance import pairwise_distance
 
-dist_matrix_init = pairwise_distance(covmats_ssd, metric='euclid')
-# dist_matrix_init = pairwise_distance(covmats, metric='riemann')
+# dist_matrix_init = pairwise_distance(covmats_white, metric='euclid')
+dist_matrix_init = pairwise_distance(covmats, metric='riemann')
 N_neig = 20
 
 # %%
@@ -293,7 +301,7 @@ for lab in labels:
 cond_cmap = mpl.colormaps['tab20'] 
 label_to_color = {lab: cond_cmap(i % 20) for i, lab in enumerate(unique_labels_ordered)}
 
-# --- Создаем фигуру ---
+# --- Создаем фигуру ---еу
 fig = plt.figure(figsize=(14, 10))
 ax = fig.add_subplot(111, projection='3d')
 
@@ -396,8 +404,8 @@ plt.show()
 # %%
 from topological_spatial_filter import fit_filters
 
-current_dim = covmats_ssd.shape[1]          # исходная размерность после SSD
-covmats_current = covmats_ssd.copy()
+current_dim = covmats_white.shape[1]          # исходная размерность после SSD
+covmats_current = covmats_white.copy()
 # current_dim = covmats.shape[1]          # исходная размерность после SSD
 # covmats_current = covmats.copy()
 
@@ -410,7 +418,7 @@ dims_history = []
 scales_history = []
 
 B_cumulative = np.eye(current_dim)
-N_epochs = covmats_ssd.copy().shape[0]
+N_epochs = covmats_white.copy().shape[0]
 
 dist_matrix_current = dist_matrix_init.copy()
 distances_history = [dist_matrix_current]
@@ -556,8 +564,8 @@ comp_idx = 0  # выберите нужный компонент
 w_comp = filters_full[comp_idx]
 a_comp = patterns_full[comp_idx]
 
-A_pattern = A_ssd @ a_comp     # Паттерн (Forward Model)
-W_sensor = W_ssd @ w_comp      # Фильтр (Inverse Model)
+A_pattern = A_ssd @ C_avg_invsqrt @ a_comp     # Паттерн (Forward Model)
+W_sensor = W_ssd @ C_avg_sqrt @ w_comp      # Фильтр (Inverse Model)
 
 p_vals = power_history[comp_idx]
 
