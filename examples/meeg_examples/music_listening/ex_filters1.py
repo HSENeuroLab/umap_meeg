@@ -158,16 +158,14 @@ eigvals, eigvecs = eigh(C_signal, C_noise_reg)
 idx_sorted = np.argsort(eigvals)[::-1]
 W_ssd = eigvecs
 component_variances = np.diag(W_ssd.T @ C_signal @ W_ssd)
-valid_components = component_variances > 0
-n_components_ssd = len(valid_components[valid_components==True])
-
+valid_components = [v > 1e-6 for v in component_variances]
 W_ssd = W_ssd[:, valid_components]
 variances_filtered = component_variances[valid_components]
 W_ssd = W_ssd / np.sqrt(variances_filtered)
 
 A_ssd = C_signal @ W_ssd
-
-print(f"SSD выполнено на сшитых блоках, получено {n_components_ssd} компонент.")
+n_components_ssd = W_ssd.shape[1]
+print(f"SSD выполнено: получено {n_components_ssd} компонент.")
 
 # %%
 Wsize = 2
@@ -262,9 +260,9 @@ for i in range(n_windows):
 print(f"Эпохи спроецированы в SSD-пространство, размер: {X_windows_ssd_proj.shape}")
 
 # %%
-covmats_band = Covariances(estimator='oas').fit_transform(X_windows_band)
-covmats_ssd = Covariances(estimator='oas').fit_transform(X_windows_ssd_proj)
-covmats = Covariances(estimator='oas').fit_transform(X_windows_unfilt)
+covmats_band = Covariances().fit_transform(X_windows_band)
+covmats_ssd = Covariances().fit_transform(X_windows_ssd_proj)
+covmats = Covariances().fit_transform(X_windows_unfilt)
 
 # %%
 print("Отбеливание ковариационных матриц по среднему арифметическому...")
@@ -406,8 +404,8 @@ plt.show()
 from topological_spatial_filter import fit_filters
 
 n_iters = 3
-N_dim = 4
-n_neighbors = 30
+N_dim = 2
+n_neighbors = 20
 
 found_filters = []
 found_patterns = []
@@ -440,7 +438,7 @@ for it in range(n_iters):
     w_opt, _, _, _, _ = fit_filters(
         C=C_current, 
         D_matrix=dist_matrix, 
-        N_dim=N_dim,             
+        N_dim=N_dim,                
         K_restarts=1, 
         n_neighbors=n_neighbors, 
         epochs=500, 
@@ -526,7 +524,7 @@ def format_umap_axes(ax):
     ax.tick_params(axis='both', which='both', length=0)
     ax.grid(True, linestyle='--', alpha=0.5, zorder=0)
 
-comp_idx = 0
+comp_idx = 5
 
 w_comp = found_filters[comp_idx]
 a_comp = found_patterns[comp_idx]
@@ -536,12 +534,9 @@ A_pattern = a_comp
 
 p_vals = []
 for c_i in covmats_band:
-    p_vals.append(np.log(w_comp.T @ c_i @ w_comp))
-
-plt.plot(p_vals)
-
-# %%
-
+    # w_ssd = np.linalg.pinv(W_ssd) @ w_comp
+    w_ssd = w_comp
+    p_vals.append(np.log(w_ssd.T @ c_i @ w_ssd))
 
 # UMAP дефлированного пространства для данного этапа
 umap_undefl = umap_coords_history[0]
