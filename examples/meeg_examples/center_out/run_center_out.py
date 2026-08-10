@@ -35,8 +35,8 @@ print("===============================================================\n")
 # -----------------------------------------------------------------
 # 1. ПАРАМЕТРЫ АНАЛИЗА
 # -----------------------------------------------------------------
-# fpath = "Z:/asbelokopytov/center_out/eeg/patients/Patient_4_CenterOut_OFF_EEG_clean_epochs.fif"
-fpath = "Z:/asbelokopytov/center_out/eeg/healthy/Control_10_CenterOut_epochs.fif"
+fpath = "Z:/asbelokopytov/center_out/eeg/patients/Patient_3_CenterOut_OFF_EEG_clean_epochs.fif"
+# fpath = "Z:/asbelokopytov/center_out/eeg/healthy/Control_10_CenterOut_epochs.fif"
 
 freq_bands = {
     'Mu': [9, 14],
@@ -156,7 +156,7 @@ if label_mode == 'categorical_binary':
     unique_window_times = np.array(window_times)
     trial_labels = np.zeros(len(unique_window_times), dtype=int)
     for i, t in enumerate(unique_window_times):
-        trial_labels[i] = 0 if t < event_time else -1
+        trial_labels[i] = -1 if t < event_time else -1
     labels = np.tile(trial_labels, n_trials)
     target_metric = 'categorical'
 
@@ -178,8 +178,12 @@ covmats_white = C_avg_invsqrt @ covmats @ C_avg_invsqrt
 # -----------------------------------------------------------------
 # 5. РИМАНОВА ДЕФЛЯЦИЯ (БЕЗ ОТБЕЛИВАНИЯ)
 # -----------------------------------------------------------------
-n_iters = 3
-N_dim = 3
+C_current = covmats_white.copy()
+dist_matrix = pairwise_distance(C_current, metric='riemann')
+
+# %%
+n_iters = 1
+N_dim = 4
 n_neighbors = 30
 
 found_filters = []
@@ -193,8 +197,15 @@ Q_acc = np.eye(n_components_ssd)
 for it in range(n_iters):
     print(f"\n  -> Итерация дефляции {it + 1}/{n_iters} ...")
     
-    dist_matrix = pairwise_distance(C_current, metric='riemann')
-    
+    # dist_matrix = pairwise_distance(C_current, metric='riemann')
+    # N = dist_matrix.shape[0]
+    # shuffled_indices = np.random.permutation(N)
+    # dist_matrix = dist_matrix[shuffled_indices, :][:, shuffled_indices]
+    # random_points = np.random.rand(N, 10)    
+    # Строим честную псевдоматрицу расстояний
+    # dist_matrix = pairwise_distance(random_points, metric='euclid')
+    # dist_matrix = np.zeros(N)
+
     print("     Вычисление UMAP для текущего подпространства...")
     reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, 
                         metric='precomputed', target_metric=target_metric)
@@ -217,32 +228,38 @@ for it in range(n_iters):
     )
     
     W_cur = w_opt[0].T 
+    # W_cur = np.random.rand(W_cur.shape[0],W_cur.shape[1])
     C_mean_current = np.mean(C_current, axis=0)
     A_cur = C_mean_current @ W_cur   
     
     W_ssd_white = Q_acc @ W_cur      
-    A_ssd_white = Q_acc @ A_cur
-    
+    A_ssd_white = Q_acc @ A_cur    
+
     W_ssd_orig = C_avg_invsqrt @ W_ssd_white   
     A_ssd_orig = C_avg_sqrt @ A_ssd_white      
     
     W_global = W_ssd @ W_ssd_orig
     A_global = A_ssd @ A_ssd_orig
+    W_global = W_ssd[:,0:4]
+    A_global = A_ssd[:,0:4]
     
     for d in range(N_dim):
         found_filters.append(W_global[:, d])
         found_patterns.append(A_global[:, d])
     
     A_ssd_accumulated.append(A_ssd_white)
-    
-    A_stacked = np.hstack(A_ssd_accumulated)
-    Q_acc = null_space(A_stacked.T) 
-    
-    C_current = np.zeros((covmats_white.shape[0], Q_acc.shape[1], Q_acc.shape[1]))
-    for i in range(covmats_white.shape[0]):
-        C_current[i] = Q_acc.T @ covmats_white[i] @ Q_acc
         
-# %%
+    if n_iters > 1:
+        A_stacked = np.hstack(A_ssd_accumulated)    
+        Q_acc = null_space(A_stacked.T) 
+    
+        C_current = np.zeros((covmats_white.shape[0], Q_acc.shape[1], Q_acc.shape[1]))
+        for i in range(covmats_white.shape[0]):
+            C_current[i] = Q_acc.T @ covmats_white[i] @ Q_acc
+        
+        dist_matrix = pairwise_distance(C_current, metric='riemann')
+
+# %
 # -----------------------------------------------------------------
 # 6. РАСЧЕТ ПРОФИЛЕЙ (ERD/ERS ПО УСЛОВИЯМ)
 # -----------------------------------------------------------------
@@ -283,7 +300,7 @@ for w_idx, w_glob in enumerate(found_filters):
         p_comp[i] = w_ssd.T @ covmats[i] @ w_ssd
     window_powers.append(p_comp)
 
-# %%
+# %
 # -----------------------------------------------------------------
 # 6.5. ВЫРАВНИВАНИЕ UMAP-ВЛОЖЕНИЙ (АЛГОРИТМ КАБША / PROCRUSTES)
 # -----------------------------------------------------------------
@@ -317,7 +334,7 @@ for coords in umap_coords_history:
 
 umap_coords_history = aligned_umap_coords
 
-# %%
+# %
 # -----------------------------------------------------------------
 # 7. БЛОЧНАЯ ВИЗУАЛИЗАЦИЯ (UMAP, ТОПОГРАФИЯ, ДИНАМИКА ПО УСЛОВИЯМ)
 # -----------------------------------------------------------------
