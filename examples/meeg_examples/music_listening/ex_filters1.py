@@ -329,7 +329,7 @@ embedder = ParametricUMAP(
     metric="precomputed",
     parametric_reconstruction=True,
     autoencoder_loss=True,
-    parametric_reconstruction_loss_fcn=custom_cov_mse,
+    parametric_reconstruction_loss_fcn=riemannian_distance_loss,
     verbose=True
 )
 
