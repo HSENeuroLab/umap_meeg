@@ -15,7 +15,6 @@ if lib_directory not in sys.path:
 from pyriemann.estimation import Covariances
 from pyriemann.utils.base import invsqrtm
 from pyriemann.geometry.distance import pairwise_distance
-from topological_spatial_filter import fit_filters
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -86,11 +85,11 @@ w_size_samp = int(w_size_sec * Fs)
 w_step_samp = int(w_step_sec * Fs)
 
 # %%
-# from mne.preprocessing import ICA
+from mne.preprocessing import ICA
 
-# ica = ICA(n_components=0.999, random_state=97, method='fastica')
-# ica.fit(epochs)
-# ica.plot_components()
+ica = ICA(n_components=0.999, random_state=97, method='fastica')
+ica.fit(epochs)
+ica.plot_components()
 
 # %%
 # -----------------------------------------------------------------
@@ -166,185 +165,347 @@ all_windows_ssd = np.zeros((n_win, n_components_ssd, n_samp))
 for i in range(n_win):
     all_windows_ssd[i] = W_ssd.T @ all_windows[i]
 
-covmats = Covariances(estimator='oas').fit_transform(all_windows_ssd)
+covmats_ssd = Covariances().fit_transform(all_windows_ssd / np.std(all_windows_ssd))
+covmats = Covariances().fit_transform(all_windows / np.std(all_windows))
 
-print("Отбеливание ковариационных матриц по среднему арифметическому...")
-C_avg = np.mean(covmats, axis=0)                     
+# print("Отбеливание ковариационных матриц по среднему арифметическому...")
+C_avg = np.mean(covmats_ssd, axis=0)                     
 C_avg_invsqrt = invsqrtm(C_avg)                       
 C_avg_sqrt = np.linalg.inv(C_avg_invsqrt)             
-covmats_white = C_avg_invsqrt @ covmats @ C_avg_invsqrt
+covmats_white = C_avg_invsqrt @ covmats_ssd @ C_avg_invsqrt
 
 # %%
 # -----------------------------------------------------------------
 # 5. РИМАНОВА ДЕФЛЯЦИЯ (БЕЗ ОТБЕЛИВАНИЯ)
 # -----------------------------------------------------------------
-C_current = covmats_white.copy()
+C_current = covmats_ssd.copy()
 dist_matrix = pairwise_distance(C_current, metric='riemann')
+dist_matrix_init = dist_matrix.copy()
 
 # %%
-n_iters = 1
-N_dim = 4
-n_neighbors = 30
+import tensorflow as tf
+from umap.parametric_umap import ParametricUMAP
+import numpy as np
 
-found_filters = []
-found_patterns = []
-umap_coords_history = []
+n_ch_white = covmats.shape[1]
 
-C_current = covmats_white.copy()
-A_ssd_accumulated = []
-Q_acc = np.eye(n_components_ssd)
+# =============================================================================
+# ПОДГОТОВКА ДАННЫХ
+# =============================================================================
+# Нормализация жизненно необходима, чтобы обучаемый шум стартовал в адекватном масштабе
+X_cov_flat = covmats.reshape(covmats.shape[0], -1).astype(np.float32)
+input_dim = X_cov_flat.shape[1]
 
-for it in range(n_iters):
-    print(f"\n  -> Итерация дефляции {it + 1}/{n_iters} ...")
-    
-    # dist_matrix = pairwise_distance(C_current, metric='riemann')
-    # N = dist_matrix.shape[0]
-    # shuffled_indices = np.random.permutation(N)
-    # dist_matrix = dist_matrix[shuffled_indices, :][:, shuffled_indices]
-    # random_points = np.random.rand(N, 10)    
-    # Строим честную псевдоматрицу расстояний
-    # dist_matrix = pairwise_distance(random_points, metric='euclid')
-    # dist_matrix = np.zeros(N)
+N_dim = 2          
+N_patterns = 20
 
-    print("     Вычисление UMAP для текущего подпространства...")
-    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, 
-                        metric='precomputed', target_metric=target_metric)
-    umap_coords = reducer.fit_transform(dist_matrix, y=labels)
-    umap_coords_history.append(umap_coords)
+# =============================================================================
+# ДЕКОДЕР СО СТАТИЧНЫМ ШУМОМ
+# =============================================================================
+class SpatialPatternDecoder(tf.keras.layers.Layer):
+    def __init__(self, M_channels, N_patterns, **kwargs):
+        super().__init__(**kwargs)
+        self.M_channels = M_channels
+        self.N_patterns = N_patterns
 
-    print("     Оптимизация фильтров...")
-    w_opt, _, _, _, _ = fit_filters(
-        C=C_current, 
-        D_matrix=dist_matrix, 
-        N_dim=N_dim,             
-        labels=labels,           
-        target_metric=target_metric, 
-        target_weight=0.5,       
-        K_restarts=1, 
-        n_neighbors=n_neighbors, 
-        epochs=500, 
-        lr=0.05, 
-        verbose=True
-    )
-    
-    W_cur = w_opt[0].T 
-    # W_cur = np.random.rand(W_cur.shape[0],W_cur.shape[1])
-    C_mean_current = np.mean(C_current, axis=0)
-    A_cur = C_mean_current @ W_cur   
-    
-    W_ssd_white = Q_acc @ W_cur      
-    A_ssd_white = Q_acc @ A_cur    
-
-    W_ssd_orig = C_avg_invsqrt @ W_ssd_white   
-    A_ssd_orig = C_avg_sqrt @ A_ssd_white      
-    
-    W_global = W_ssd @ W_ssd_orig
-    A_global = A_ssd @ A_ssd_orig
-    
-    for d in range(N_dim):
-        found_filters.append(W_global[:, d])
-        found_patterns.append(A_global[:, d])
-    
-    A_ssd_accumulated.append(A_ssd_white)
+    def build(self, input_shape):
+        # 1. Глобальные паттерны (Матрица A)
+        self.A = self.add_weight(
+            shape=(self.M_channels, self.N_patterns),
+            initializer=tf.keras.initializers.RandomNormal(stddev=0.1),
+            trainable=True,
+            name="A_patterns"
+        )
         
-    if n_iters > 1:
-        A_stacked = np.hstack(A_ssd_accumulated)    
-        Q_acc = null_space(A_stacked.T) 
-    
-        C_current = np.zeros((covmats_white.shape[0], Q_acc.shape[1], Q_acc.shape[1]))
-        for i in range(covmats_white.shape[0]):
-            C_current[i] = Q_acc.T @ covmats_white[i] @ Q_acc
+        # 2. Внутренний слой для генерации мощностей (z) из UMAP-координат
+        self.z_dense = tf.keras.layers.Dense(
+            units=self.N_patterns, 
+            activation="linear", 
+            name="z_projection"
+        )
         
-        dist_matrix = pairwise_distance(C_current, metric='riemann')
+        # 3. ОБУЧАЕМЫЙ ГЛОБАЛЬНЫЙ ШУМ (СТАТИЧНЫЙ!)
+        # Индивидуальный для каждого сенсора, но не меняется во времени
+        self.noise_log = self.add_weight(
+            shape=(self.M_channels,),
+            initializer=tf.keras.initializers.Constant(-3.0),
+            trainable=True,
+            name="sensor_noise"
+        )
+
+    def call(self, inputs):
+        # Генерируем параметры текущей эпохи
+        z = self.z_dense(inputs)               # (batch_size, N_patterns)
+        
+        A_norm = tf.math.l2_normalize(self.A, axis=0)
+        P = tf.exp(z)
+        
+        # Реконструкция полезного сигнала: A * P * A^T
+        C_signal = tf.einsum("mf,bf,lf->bml", A_norm, P, A_norm)
+        
+        # Статичный диагональный шум
+        noise_variance = tf.math.softplus(self.noise_log)
+        noise_diag = tf.linalg.diag(noise_variance)
+        
+        # Итоговая ковариация (TF автоматически прибавит матрицу ко всем батчам)
+        C_recon = C_signal + noise_diag
+        return C_recon
+    
+# def riemannian_distance_loss(y_true_flat, y_pred_flat):
+#     y_true_flat = tf.cast(y_true_flat, tf.float32)
+#     y_pred_flat = tf.cast(y_pred_flat, tf.float32)
+
+#     M = n_ch_white  
+    
+#     C_true = tf.reshape(y_true_flat, [-1, M, M])
+#     C_pred = tf.reshape(y_pred_flat, [-1, M, M])
+    
+#     # СГЛАЖИВАНИЕ МНОГООБРАЗИЯ (Riemannian Smoothing)
+#     # Защищает метрику от взрыва на направлениях с нулевой дисперсией (например, после Average Reference)
+#     smoothing_factor = 1e-2  
+#     eye_M = tf.eye(M, dtype=tf.float32)
+    
+#     # Добавляем сглаживание к матрицам
+#     C_true_reg = C_true + smoothing_factor * eye_M
+#     C_pred_reg = C_pred + smoothing_factor * eye_M
+
+#     # Защитная константа для стабильности градиентов
+#     eps = 1e-7
+
+#     # Риманово расстояние
+#     eigvals_true, eigvecs_true = tf.linalg.eigh(C_true_reg)
+#     inv_sqrt_eigvals = 1.0 / tf.sqrt(tf.maximum(eigvals_true, eps))
+#     C_true_invsqrt = tf.einsum('bij,bj,bkj->bik', eigvecs_true, inv_sqrt_eigvals, eigvecs_true)
+
+#     C_mid = tf.einsum('bij,bjk,bkl->bil', C_true_invsqrt, C_pred_reg, C_true_invsqrt)
+#     C_mid = 0.5 * (C_mid + tf.transpose(C_mid, [0, 2, 1])) 
+
+#     eigvals_mid, eigvecs_mid = tf.linalg.eigh(C_mid)
+#     log_eigvals_mid = tf.math.log(tf.maximum(eigvals_mid, eps))
+#     logC_mid = tf.einsum('bij,bj,bkj->bik', eigvecs_mid, log_eigvals_mid, eigvecs_mid)
+
+#     dist_sq = tf.reduce_sum(tf.square(logC_mid), axis=(1, 2))
+#     return tf.reduce_mean(dist_sq)
+def pseudo_inverse_variance_loss(y_true_flat, y_pred_flat, A, reg=1e-4):
+    M = A.shape[0]
+    C_true = tf.reshape(y_true_flat, [-1, M, M])
+    C_pred = tf.reshape(y_pred_flat, [-1, M, M])
+    
+    # Нормализуем паттерны по столбцам
+    A_norm = tf.math.l2_normalize(A, axis=0)  # (M, Np)
+    
+    # Регуляризованная псевдообратная матрица
+    Np = tf.shape(A_norm)[1]
+    I = tf.eye(Np, dtype=tf.float32)
+    Gram = tf.matmul(A_norm, A_norm, transpose_a=True) + reg * I  # (Np, Np)
+    A_pinv = tf.matmul(tf.linalg.inv(Gram), A_norm, transpose_b=True)  # (Np, M)
+    
+    # Оценка ковариации источников
+    # tf.einsum('ij,bjk,lk->bil', A_pinv, C_true, A_pinv)
+    S_true = tf.einsum('ij,bjk,lk->bil', A_pinv, C_true, A_pinv)  # (batch, Np, Np)
+    S_pred = tf.einsum('ij,bjk,lk->bil', A_pinv, C_pred, A_pinv)
+    
+    # Диагональные элементы (мощности источников)
+    diag_true = tf.linalg.diag_part(S_true)
+    diag_pred = tf.linalg.diag_part(S_pred)
+    
+    # Среднеквадратичная ошибка
+    loss = tf.reduce_mean(tf.square(diag_true - diag_pred))
+    return loss
+
+# =============================================================================
+# СБОРКА МОДЕЛЕЙ (Адаптировано с явным z_layer)
+# =============================================================================
+encoder = tf.keras.Sequential([
+    tf.keras.layers.InputLayer(shape=(input_dim,)),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(N_dim, activation="linear", name="umap_embedding")
+])
+
+# Декодер с явным выделением z_layer для удобного извлечения мощностей
+decoder = tf.keras.Sequential([
+    tf.keras.layers.InputLayer(shape=(N_dim,)),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(N_patterns, activation="linear", name="z_layer"),
+    SpatialPatternDecoder(M_channels=n_ch_white, N_patterns=N_patterns, name="spatial_decoder"),
+    tf.keras.layers.Flatten()
+])
+
+# # =============================================================================
+# # ОБУЧЕНИЕ ParametricUMAP
+# # =============================================================================
+# print(f"Обучение с N_dim={N_dim}, N_patterns={N_patterns}")
+# embedder = ParametricUMAP(
+#     encoder=encoder,
+#     decoder=decoder,
+#     n_components=N_dim,
+#     dims=(input_dim,),
+#     metric="precomputed",
+#     parametric_reconstruction=True,
+#     autoencoder_loss=True,
+#     parametric_reconstruction_loss_fcn=pseudo_inverse_variance_loss,
+#     verbose=True
+# )
+# после создания decoder:
+spatial_decoder_layer = decoder.get_layer("spatial_decoder")
+A_tensor = spatial_decoder_layer.A  # ссылка на обучаемый вес
+
+def my_loss(y_true, y_pred):
+    return pseudo_inverse_variance_loss(y_true, y_pred, A_tensor)
+
+embedder = ParametricUMAP(
+    encoder=encoder,
+    decoder=decoder,
+    n_components=N_dim,
+    dims=(input_dim,),
+    metric="precomputed",
+    parametric_reconstruction=True,
+    autoencoder_loss=True,
+    parametric_reconstruction_loss_fcn=my_loss,
+    verbose=True
+)
+
+embedder.fit(X_cov_flat, precomputed_distances=dist_matrix_init)
+umap_coords = embedder.embedding_
 
 # %%
-# %
-# -----------------------------------------------------------------
-# 6. РАСЧЕТ ПРОФИЛЕЙ (ERD/ERS ПО УСЛОВИЯМ)
-# -----------------------------------------------------------------
-print("\nРасчет временных профилей (ERD/ERS) по условиям...")
-erd_profiles_dict = [] 
-window_powers = [] 
+# =============================================================================
+# 6. ИЗВЛЕЧЕНИЕ ПАРАМЕТРОВ И ВИЗУАЛИЗАЦИЯ ШУМА
+# =============================================================================
+import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
+import matplotlib.colors as mcolors
+from matplotlib.lines import Line2D
+import numpy as np
+import tensorflow as tf
 
-base_mask = (times >= baseline_window[0]) & (times <= baseline_window[1])
+print("Извлечение параметров из обученной модели...")
 
-for w_idx, w_glob in enumerate(found_filters):
-    S = np.tensordot(w_glob, data, axes=(0, 1))
-    env = np.abs(hilbert(S, axis=1))
-    
-    # Словарь для хранения ERD для каждого условия в этой компоненте
+latent = embedder.encoder.predict(X_cov_flat)   # (n_windows_total, N_dim)
+
+# 1. Извлекаем сырые значения z (логарифмы мощностей)
+decoder_input = tf.keras.Input(shape=(N_dim,))
+x = decoder_input
+for layer in embedder.decoder.layers:
+    x = layer(x)
+    if layer.name == "z_layer":
+        break
+
+z_model = tf.keras.Model(inputs=decoder_input, outputs=x)
+z_values = z_model.predict(latent)              # (n_windows_total, N_patterns)
+
+# Переводим в реальные мощности
+powers = np.exp(z_values)
+
+spatial_decoder_layer = embedder.decoder.get_layer("spatial_decoder")
+noise_log_tensor = spatial_decoder_layer.noise_log
+static_noise_variances = tf.math.softplus(noise_log_tensor).numpy()
+
+# 3. Извлекаем матрицу паттернов в отбеленном SSD-пространстве
+A_learned_raw = spatial_decoder_layer.A.numpy()   # (n_components_ssd, N_patterns)
+A_orig = A_learned_raw / np.linalg.norm(A_learned_raw, axis=0)
+
+# Преобразование в исходное пространство каналов
+# A_orig = A_ssd @ C_avg_sqrt @ A_white
+A_global = A_orig / np.linalg.norm(A_orig, axis=0)
+found_patterns = [A_global[:, i] for i in range(N_patterns)]
+
+# 4. РАСЧЕТ ФИЛЬТРОВ ХАУФЕ
+C_global_mean = np.mean(covmats, axis=0)
+C_global_inv = np.linalg.pinv(C_global_mean)
+found_filters = [C_global_inv @ A_global[:, i] for i in range(N_patterns)]
+
+print("Модели обучены end-to-end, сырые паттерны, мощности и фильтры извлечены.")
+
+# Отрисовка статического шума
+fig_noise, ax_noise = plt.subplots(figsize=(10, 4))
+ax_noise.bar(range(len(static_noise_variances)), static_noise_variances, color='teal', alpha=0.7)
+ax_noise.set_title('Аппаратный (диагональный) шум по сенсорам (Статичный)', fontsize=14)
+ax_noise.set_xlabel('Индекс сенсора (канал ЭЭГ)')
+ax_noise.set_ylabel('Дисперсия шума')
+ax_noise.grid(True, axis='y', linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.show()
+
+# %%
+# =============================================================================
+# 7. РАСЧЕТ ПРОФИЛЕЙ ERD/ERS: МОДЕЛЬ И КЛАССИЧЕСКИЙ ФИЛЬТР
+# =============================================================================
+print("\nИзвлечение временных профилей ERD/ERS (Модель vs Классический фильтр)...")
+
+unique_window_times = np.array(window_times)
+num_windows_per_trial = len(unique_window_times)
+window_conditions = np.repeat(trial_cond_labels, num_windows_per_trial)
+
+# 1. Мощности нейросети
+powers_reshaped = powers.reshape(n_trials, num_windows_per_trial, N_patterns)
+
+erd_profiles_dict = []       # Для модели
+erd_filt_profiles_dict = []  # Для классического фильтра
+
+base_mask = (unique_window_times >= baseline_window[0]) & (unique_window_times <= baseline_window[1])
+
+for comp_idx in range(N_patterns):
     comp_erd = {}
+    comp_filt_erd = {}
+    
+    # Извлекаем фильтр Хауфе для текущей компоненты
+    w = found_filters[comp_idx]
+    
+    # Считаем мощность классическим способом для каждого окна: p = w^T * C * w
+    # covmats имеет форму (n_windows_total, n_channels, n_channels)
+    p_filt = np.einsum('i,nij,j->n', w, covmats, w)
+    p_filt_reshaped = p_filt.reshape(n_trials, num_windows_per_trial)
     
     for cond in conditions:
-        # Выбираем трайлы только для текущего условия
-        cond_mask = trial_cond_labels == cond
-        env_cond = env[cond_mask]
+        cond_mask = (trial_cond_labels == cond)
         
-        base_power = np.mean(env_cond[:, base_mask], axis=1, keepdims=True)
-        erd_cond = (env_cond - base_power) / base_power * 100
+        # --- ERD/ERS ДЛЯ МОДЕЛИ ---
+        cond_powers = powers_reshaped[cond_mask, :, comp_idx]
+        base_power = np.mean(cond_powers[:, base_mask], axis=1, keepdims=True)
+        erd_cond = (cond_powers - base_power) / base_power * 100
         
-        # Сохраняем среднее, отклонение и количество трайлов для SE
         comp_erd[cond] = {
             'mean': np.mean(erd_cond, axis=0),
             'std': np.std(erd_cond, axis=0),
             'n_trials': np.sum(cond_mask)
         }
         
+        # --- ERD/ERS ДЛЯ ФИЛЬТРА ХАУФЕ ---
+        cond_filt_powers = p_filt_reshaped[cond_mask, :]
+        base_filt_power = np.mean(cond_filt_powers[:, base_mask], axis=1, keepdims=True)
+        erd_filt_cond = (cond_filt_powers - base_filt_power) / base_filt_power * 100
+        
+        comp_filt_erd[cond] = {
+            'mean': np.mean(erd_filt_cond, axis=0),
+            'std': np.std(erd_filt_cond, axis=0),
+            'n_trials': np.sum(cond_mask)
+        }
+        
     erd_profiles_dict.append(comp_erd)
-    
-    # Мощность окон для UMAP-раскраски (оставляем общую для всех окон)
-    w_ssd = np.linalg.pinv(W_ssd) @ w_glob
-    p_comp = np.zeros(covmats.shape[0])
-    for i in range(covmats.shape[0]):
-        p_comp[i] = w_ssd.T @ covmats[i] @ w_ssd
-    window_powers.append(p_comp)
+    erd_filt_profiles_dict.append(comp_filt_erd)
 
-# %
-# -----------------------------------------------------------------
-# 6.5. ВЫРАВНИВАНИЕ UMAP-ВЛОЖЕНИЙ (АЛГОРИТМ КАБША / PROCRUSTES)
-# -----------------------------------------------------------------
-print("Выравнивание UMAP-координат между итерациями дефляции...")
-aligned_umap_coords = []
-target_coords = None
 
-for coords in umap_coords_history:
-    if coords is None:
-        aligned_umap_coords.append(None)
-        continue
-
-    if target_coords is None:
-        aligned_umap_coords.append(coords)
-        target_coords = coords
-    else:
-        mean_src = np.mean(coords, axis=0)
-        mean_tgt = np.mean(target_coords, axis=0)
-        s0 = coords - mean_src
-        t0 = target_coords - mean_tgt
-
-        H = s0.T @ t0
-        U, S_svd, Vt = np.linalg.svd(H)
-        R = U @ Vt
-
-        scale = np.sum(t0 * (s0 @ R)) / (np.sum(s0 * s0) + 1e-8)
-        aligned_coords = (s0 @ R) * scale + mean_tgt
-
-        aligned_umap_coords.append(aligned_coords)
-        target_coords = aligned_coords   
-
-umap_coords_history = aligned_umap_coords
-
-# %
-# -----------------------------------------------------------------
-# 7. БЛОЧНАЯ ВИЗУАЛИЗАЦИЯ (UMAP, ТОПОГРАФИЯ, ДИНАМИКА ПО УСЛОВИЯМ)
-# -----------------------------------------------------------------
-print("Построение итоговых дашбордов...")
+# %%
+# =============================================================================
+# 8. СТАТИЧНЫЙ ДАШБОРД СО СРАВНЕНИЕМ ОГИБАЮЩИХ (4 КОЛОНКИ)
+# =============================================================================
+print("\nПостроение сравнительных дашбордов...")
 
 umap_cmap = 'plasma' 
-cond_colors = {conditions[0]: 'tab:blue', conditions[1]: 'tab:orange', 
-               conditions[2]: 'tab:green', conditions[3]: 'tab:red'}
+cond_colors = {
+    conditions[0]: 'tab:blue', 
+    conditions[1]: 'tab:orange', 
+    conditions[2]: 'tab:green', 
+    conditions[3]: 'tab:red'
+}
 
-n_comps = len(found_filters)
-comps_per_fig = 3  # РИСУЕМ ПО 2 КОМПОНЕНТЫ НА ГРАФИК
+n_comps = len(found_patterns)
+comps_per_fig = 3 
 n_figs = int(np.ceil(n_comps / comps_per_fig))
 
 for fig_idx in range(n_figs):
@@ -352,83 +513,128 @@ for fig_idx in range(n_figs):
     end_comp = min(start_comp + comps_per_fig, n_comps)
     comps_in_this_fig = end_comp - start_comp
     
-    fig = plt.figure(figsize=(18, 5.0 * comps_in_this_fig))
-    gs = GridSpec(comps_in_this_fig, 3, figure=fig, width_ratios=[1, 1.2, 2.5], wspace=0.2, hspace=0.4)
+    # Немного расширяем фигуру под 4 колонки
+    fig = plt.figure(figsize=(22, 5.0 * comps_in_this_fig))
+    gs = GridSpec(comps_in_this_fig, 4, figure=fig, width_ratios=[1, 1.2, 2.5, 2.5], wspace=0.2, hspace=0.4)
     
     for local_idx, comp_idx in enumerate(range(start_comp, end_comp)):
-        iter_num = comp_idx // N_dim
         A_pattern = found_patterns[comp_idx]
-        p_vals = window_powers[comp_idx] 
-        
+        p_vals = powers[:, comp_idx] 
         vmax_val = np.percentile(p_vals, 95)
         vmin_val = np.min(p_vals) 
-        umap_coords = umap_coords_history[iter_num]
-
-        # --- КОЛОНКА 1: Паттерн ---
+        
+        # --- КОЛОНКА 1: Пространственный паттерн ---
         ax_patt = fig.add_subplot(gs[local_idx, 0])
         mne.viz.plot_topomap(A_pattern, info, axes=ax_patt, show=False, contours=4)
         ax_patt.set_title(f'Паттерн {comp_idx + 1}', pad=10, fontsize=13, fontweight='bold')
 
-        # --- КОЛОНКА 2: UMAP Вложение ---
+        # --- КОЛОНКА 2: UMAP Пространство ---
         ax_umap = fig.add_subplot(gs[local_idx, 1])
         sort_idx = np.argsort(p_vals)
         sc = ax_umap.scatter(umap_coords[sort_idx, 0], umap_coords[sort_idx, 1],
                              c=p_vals[sort_idx], cmap=umap_cmap, s=20, zorder=2, 
-                             alpha=0.4, edgecolors='none', vmin=vmin_val, vmax=vmax_val)
+                             alpha=0.6, edgecolors='none', vmin=vmin_val, vmax=vmax_val)
         cb = plt.colorbar(sc, ax=ax_umap)
-        title_str = 'Исходное вложение' if iter_num == 0 else f'Вложение после дефляции {iter_num}'
-        ax_umap.set_title(title_str, fontsize=12)
+        cb.set_label('Мощность $e^z$', rotation=270, labelpad=15)
+        ax_umap.set_title('Проекция мощности', fontsize=12)
         format_umap_axes(ax_umap)
 
-        # --- КОЛОНКА 3: Динамика мощности ERD/ERS (По условиям) ---
-        ax_env = fig.add_subplot(gs[local_idx, 2])
-        
-        ax_env.axvspan(baseline_window[0], baseline_window[1], color='gray', alpha=0.2, zorder=0, label='Baseline')
-        ax_env.axvline(event_time, color='black', linestyle='--', alpha=0.7, zorder=1, label='Стимул')
-        ax_env.axhline(0, color='black', linewidth=1, zorder=1)
-        
+        # Синхронизация лимитов Y для графиков ERD
         ymin_list, ymax_list = [], []
-        
-        # Рисуем каждую кривую
         for cond in conditions:
-            mean_erd = erd_profiles_dict[comp_idx][cond]['mean']
-            se_erd = erd_profiles_dict[comp_idx][cond]['std'] / np.sqrt(erd_profiles_dict[comp_idx][cond]['n_trials'])
-            
-            ax_env.plot(times, mean_erd, color=cond_colors[cond], lw=2, zorder=3, label=cond)
-            ax_env.fill_between(times, mean_erd - se_erd, mean_erd + se_erd, 
-                                color=cond_colors[cond], alpha=0.15, zorder=2)
-            
-            # Запоминаем мин/макс для правильной отрисовки полосок значимости
-            ymin_list.append(np.min(mean_erd - se_erd))
-            ymax_list.append(np.max(mean_erd + se_erd))
+            # Границы для модели
+            m1 = erd_profiles_dict[comp_idx][cond]['mean']
+            se1 = erd_profiles_dict[comp_idx][cond]['std'] / np.sqrt(erd_profiles_dict[comp_idx][cond]['n_trials'])
+            ymin_list.append(np.min(m1 - se1))
+            ymax_list.append(np.max(m1 + se1))
+            # Границы для классического фильтра
+            m2 = erd_filt_profiles_dict[comp_idx][cond]['mean']
+            se2 = erd_filt_profiles_dict[comp_idx][cond]['std'] / np.sqrt(erd_filt_profiles_dict[comp_idx][cond]['n_trials'])
+            ymin_list.append(np.min(m2 - se2))
+            ymax_list.append(np.max(m2 + se2))
             
         ymin, ymax = np.min(ymin_list), np.max(ymax_list)
         y_range = ymax - ymin
-        
-        # Отрисовка полосок значимости для каждого условия (снизу вверх)
-        for i_c, cond in enumerate(conditions):
-            mean_erd = erd_profiles_dict[comp_idx][cond]['mean']
-            se_erd = erd_profiles_dict[comp_idx][cond]['std'] / np.sqrt(erd_profiles_dict[comp_idx][cond]['n_trials'])
-            sig_mask = np.abs(mean_erd) > (1.96 * se_erd)
+        ylim_bottom = ymin - (0.2 * y_range) # Оставляем место внизу для полосок значимости
+        ylim_top = ymax + (0.1 * y_range)
+
+        # Функция для отрисовки профиля ERD на переданной оси
+        def plot_erd(ax, profiles_dict, title_text):
+            ax.axvspan(baseline_window[0], baseline_window[1], color='gray', alpha=0.2, zorder=0, label='Baseline')
+            ax.axvline(event_time, color='black', linestyle='--', alpha=0.7, zorder=1, label='Стимул')
+            ax.axhline(0, color='black', linewidth=1, zorder=1)
             
-            band_y = ymin - (0.05 * y_range) - (i_c * 0.03 * y_range)
-            # Рисуем точками только там, где значимо
-            ax_env.scatter(times[sig_mask], np.full(np.sum(sig_mask), band_y), 
-                           color=cond_colors[cond], s=8, marker='s', zorder=4)
+            for i_c, cond in enumerate(conditions):
+                mean_erd = profiles_dict[comp_idx][cond]['mean']
+                se_erd = profiles_dict[comp_idx][cond]['std'] / np.sqrt(profiles_dict[comp_idx][cond]['n_trials'])
+                
+                ax.plot(unique_window_times, mean_erd, color=cond_colors[cond], lw=2, zorder=3, label=cond)
+                ax.fill_between(unique_window_times, mean_erd - se_erd, mean_erd + se_erd, 
+                                color=cond_colors[cond], alpha=0.15, zorder=2)
+                
+            ax.grid(True, axis='both', linestyle=':', alpha=0.6)
+            ax.set_xlim([unique_window_times[0], unique_window_times[-1]])
+            ax.set_title(title_text, fontsize=12, fontweight='bold')
+            
+            if local_idx == 0: ax.legend(loc='upper right', fontsize=9, ncol=2)
+            if local_idx == comps_in_this_fig - 1:
+                ax.set_xlabel('Время центра окна (с)', fontsize=12)
+            else:
+                ax.set_xticklabels([])
 
-        ax_env.grid(True, axis='both', linestyle=':', alpha=0.6)
-        ax_env.set_xlim([times[0], times[-1]])
-        
-        if local_idx == 0:
-            ax_env.legend(loc='upper right', fontsize=9, ncol=2)
-        
-        if local_idx == comps_in_this_fig - 1:
-            ax_env.set_xlabel('Время (с)', fontsize=12)
-        else:
-            ax_env.set_xticklabels([])
+        # --- КОЛОНКА 3: ERD Модели (Нейросеть) ---
+        ax_env_model = fig.add_subplot(gs[local_idx, 2])
+        plot_erd(ax_env_model, erd_profiles_dict, "ERD/ERS: Нейросеть ($e^z$)")
+        ax_env_model.set_ylabel('ERD/ERS (%)', fontsize=12)
 
-    plt.suptitle(f'TSF Анализ (Условия) | Диапазон: {selected_band_name} | Фигура {fig_idx + 1}/{n_figs}', fontsize=16, y=0.95)
-    # plt.savefig(f'tsf_dashboard_fig_{fig_idx + 1}.png', dpi=300, bbox_inches='tight')
+        # --- КОЛОНКА 4: ERD Фильтра Хауфе (Классика) ---
+        ax_env_filt = fig.add_subplot(gs[local_idx, 3])
+        plot_erd(ax_env_filt, erd_filt_profiles_dict, "ERD/ERS: Фильтр ($w^T C w$)")
+        ax_env_filt.set_yticklabels([]) # Убираем подписи оси Y, так как они идентичны колонке 3
+
+    plt.suptitle(f'TSF Анализ | Сравнение Модели и Бимформера | Фиг. {fig_idx + 1}/{n_figs}', fontsize=16, y=0.95)
     plt.show()
-
+    
 # %%
+# =============================================================================
+# 9. ВИЗУАЛИЗАЦИЯ УСРЕДНЁННОЙ ДИНАМИКИ X_cov_flat (диагональные элементы)
+# =============================================================================
+print("\nПостроение усреднённой динамики исходных ковариационных матриц...")
+
+# Переводим X_cov_flat в форму (n_trials, n_windows, n_features)
+X_cov_reshaped = X_cov_flat.reshape(n_trials, num_windows_per_trial, -1)
+
+# Индексы диагональных элементов ковариационной матрицы
+diag_indices = [i * n_channels + i for i in range(n_channels)]
+
+# Усредняем по трайлам для каждого условия
+mean_cov_by_cond = {}
+for cond in conditions:
+    mask = (trial_cond_labels == cond)
+    mean_cov_by_cond[cond] = np.mean(X_cov_reshaped[mask], axis=0)  # (n_windows, n_features)
+
+# Визуализируем первые N_cov_plots диагональных элементов (можно изменить)
+N_cov_plots = min(10, n_channels)  # сколько каналов показать
+plot_indices = diag_indices[:N_cov_plots]  # первые N_cov_plots диагональных элементов
+
+fig, axes = plt.subplots(N_cov_plots, 1, figsize=(14, 3 * N_cov_plots), sharex=True)
+if N_cov_plots == 1:
+    axes = [axes]  # чтобы не падало при одном subplot
+
+for ax, feat_idx in zip(axes, plot_indices):
+    for cond in conditions:
+        ax.plot(unique_window_times, mean_cov_by_cond[cond][:, feat_idx],
+                color=cond_colors[cond], lw=2, label=cond)
+    # Подписи
+    ax.set_ylabel(f'Диаг. {feat_idx // n_channels}')
+    ax.axvline(event_time, color='black', linestyle='--', alpha=0.7)
+    ax.axvspan(baseline_window[0], baseline_window[1], color='gray', alpha=0.2)
+    ax.grid(True, linestyle=':', alpha=0.6)
+    if ax is axes[0]:
+        ax.legend(loc='upper right', fontsize=9, ncol=2)
+    if ax is axes[-1]:
+        ax.set_xlabel('Время центра окна (с)')
+
+plt.suptitle('Усреднённая динамика диагональных элементов ковариационной матрицы по условиям', fontsize=14)
+plt.tight_layout()
+plt.show()    

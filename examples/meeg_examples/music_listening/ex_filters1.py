@@ -350,6 +350,23 @@ found_filters = [C_global_inv @ A_global[:, i] for i in range(N_patterns)]
 print("Модели обучены end-to-end, сырые паттерны и мощности извлечены.")
 
 # %%
+from pyriemann.tangentspace import TangentSpace
+import tensorflow as tf
+from umap.parametric_umap import ParametricUMAP
+import numpy as np
+
+n_ch_white = covmats.shape[1]
+
+# =============================================================================
+# ПОДГОТОВКА ДАННЫХ
+# =============================================================================
+# Нормализация жизненно необходима, чтобы обучаемый шум стартовал в адекватном масштабе
+X_cov_flat = covmats.reshape(covmats.shape[0], -1).astype(np.float32)
+input_dim = X_cov_flat.shape[1]
+
+N_dim = 2          
+N_patterns = 40    
+
 # =============================================================================
 # ДЕКОДЕР С ДИНАМИЧЕСКИМ ШУМОМ (ВНУТРЕННИЕ ПРОЕКЦИИ)
 # =============================================================================
@@ -527,7 +544,7 @@ def format_umap_axes(ax):
     ax.grid(True, linestyle='--', alpha=0.5, zorder=0)
 
 # Выбираем индекс паттерна (0..N_patterns-1)
-comp_idx = 2
+comp_idx = 7
 W_sensor = found_filters[comp_idx]
 A_pattern = found_patterns[comp_idx]
 
@@ -599,4 +616,552 @@ ax_env.legend(loc='upper right')
 
 plt.suptitle(f'Анализ компоненты {comp_idx+1} из {N_patterns}', fontsize=16)
 plt.tight_layout()
+plt.show()
+
+# %%
+# =============================================================================
+# 7. СУПЕР-ИНТЕРАКТИВНЫЙ ДАШБОРД: АКТИВАЦИЯ ИСТОЧНИКОВ В UMAP
+# =============================================================================
+import matplotlib.patheffects as pe
+from matplotlib.gridspec import GridSpec
+
+print("Подготовка интерактивного дашборда...")
+
+# 1. Отбираем самые "дисперсные" источники
+power_variances = np.var(powers, axis=0)
+top_n = min(15, N_patterns)
+top_indices = np.argsort(power_variances)[::-1][:top_n]
+
+print(f"Отображаем топ-{top_n} источников с наибольшей дисперсией: {top_indices}")
+
+# 2. Настройка цветов и легенды с сохранением ИСХОДНОГО порядка!
+# Используем ваш список new_descriptions из начала скрипта
+unique_classes = []
+for lab in new_descriptions:
+    if lab in labels and lab not in unique_classes:
+        unique_classes.append(lab)
+        
+# На всякий случай добавляем те, что есть в labels, но вдруг не попали в список
+for lab in labels:
+    if lab not in unique_classes:
+        unique_classes.append(lab)
+
+class_to_id = {lab: i + 1 for i, lab in enumerate(unique_classes)}
+cmap_classes = plt.cm.tab20
+color_map = {lab: cmap_classes(i / max(1, len(unique_classes) - 1)) for i, lab in enumerate(unique_classes)}
+point_colors = [color_map[lab] for lab in labels]
+
+# 3. Настройка сетки графика
+N_COLS_TOPO = 3
+N_ROWS_TOPO = int(np.ceil(top_n / N_COLS_TOPO))
+
+fig = plt.figure(figsize=(18, max(8, 2 * N_ROWS_TOPO)))
+gs = GridSpec(N_ROWS_TOPO + 1, N_COLS_TOPO + 2, width_ratios=[3.0, 0.5] + [1]*N_COLS_TOPO, height_ratios=[0.5] + [2]*N_ROWS_TOPO)
+
+# =============================================================================
+# ПОСТРОЕНИЕ UMAP (Левая панель)
+# =============================================================================
+ax_umap = fig.add_subplot(gs[:, 0])
+ax_text = fig.add_subplot(gs[0, 2:])
+ax_text.axis('off')
+
+# Рисуем все эпохи
+ax_umap.scatter(umap_coords[:, 0], umap_coords[:, 1], c=point_colors, 
+                s=15, alpha=0.4, edgecolors='white', linewidths=0.2, zorder=1)
+
+# Рисуем центроиды классов
+for lab in unique_classes:
+    mask = (labels == lab)
+    if not np.any(mask):
+        continue
+    cx, cy = np.mean(umap_coords[mask], axis=0)
+    ax_umap.scatter(cx, cy, marker='*', s=450, facecolor=color_map[lab], 
+                    edgecolor='black', linewidths=1.0, zorder=3)
+    # Цифра внутри звезды
+    ax_umap.text(cx, cy, str(class_to_id[lab]), fontsize=11, fontweight='bold', color='white', 
+                 ha='center', va='center', zorder=4, 
+                 path_effects=[pe.withStroke(linewidth=2.5, foreground="black")])
+
+ax_umap.set_title("Фазовое пространство UMAP", fontsize=14)
+ax_umap.set_xlabel("UMAP 1")
+ax_umap.set_ylabel("UMAP 2")
+ax_umap.grid(True, linestyle='--', alpha=0.4, zorder=0)
+
+# Легенда (увеличили ncol=4, уменьшили шрифт)
+handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color_map[lab], markersize=8) for lab in unique_classes]
+legend_labels = [f"{class_to_id[lab]}: {lab}" for lab in unique_classes]
+ax_umap.legend(handles, legend_labels, title="Условия", loc='upper center', 
+               bbox_to_anchor=(0.5, -0.08), ncol=4, fontsize=8, title_fontsize=10)
+
+# Информационный текст сверху
+txt_info = ax_text.text(0.5, 0.5, "Наведите курсор на точки UMAP", 
+                        ha='center', va='center', fontsize=16, color='gray', fontweight='bold')
+
+# =============================================================================
+# ПОСТРОЕНИЕ СТАТИЧНЫХ ТОПОМАПОВ (Правая панель)
+# =============================================================================
+print("Генерация топомапов (может занять несколько секунд)...")
+ax_topos = []
+overlays = []
+titles = []
+
+mne_info = raw.info 
+
+for i, comp_idx in enumerate(top_indices):
+    row = 1 + i // N_COLS_TOPO
+    col = 2 + i % N_COLS_TOPO
+    ax = fig.add_subplot(gs[row, col])
+    
+    mne.viz.plot_topomap(found_patterns[comp_idx], mne_info, axes=ax, show=False, contours=0)
+    
+    overlay = plt.Rectangle((0, 0), 1, 1, transform=ax.transAxes, color='white', alpha=0.90, zorder=10)
+    ax.add_patch(overlay)
+    overlays.append(overlay)
+    
+    title = ax.set_title(f"Ист. {comp_idx+1}\nМощн: --", fontsize=11, color='gray')
+    titles.append(title)
+    
+    ax.axis('off')
+    ax_topos.append(ax)
+
+highlighted_point = None
+
+# =============================================================================
+# ЛОГИКА ИНТЕРАКТИВНОСТИ
+# =============================================================================
+def update_dashboard(event):
+    global highlighted_point
+    
+    if event.inaxes != ax_umap:
+        return
+    if event.name == 'motion_notify_event' and event.button is None:
+        return
+        
+    x, y = event.xdata, event.ydata
+    if x is None or y is None:
+        return
+
+    z_click = np.array([[x, y]], dtype=np.float32)
+    hidden_feats_click = hidden_features_model.predict(z_click, verbose=0)
+    z_values_click = spatial_decoder_layer.z_dense(hidden_feats_click).numpy()
+    
+    p_vals = np.exp(z_values_click)[0] 
+    p_top = p_vals[top_indices]
+    
+    dists = np.hypot(umap_coords[:, 0] - x, umap_coords[:, 1] - y)
+    min_dist_idx = np.argmin(dists)
+    
+    label = labels[min_dist_idx]
+    txt_info.set_text(f"Зона: {class_to_id[label]} ({label}) | Координаты: ({x:.1f}, {y:.1f})")
+    txt_info.set_color(color_map[label])
+
+    p_local_max = np.max(p_top)
+    p_local_min = np.min(p_top)
+    denominator = p_local_max - p_local_min
+    if denominator < 1e-6:
+        denominator = 1e-6
+
+    for i, comp_idx in enumerate(top_indices):
+        power = p_top[i]
+        norm_p = np.clip((power - p_local_min) / denominator, 0, 1)
+        
+        new_alpha = 0.95 * (1 - norm_p)
+        overlays[i].set_alpha(new_alpha)
+        
+        titles[i].set_text(f"Ист. {comp_idx+1}\nМощн: {power:.2f}")
+        
+        if norm_p > 0.4:
+            titles[i].set_color('black')
+            titles[i].set_fontweight('bold')
+        else:
+            titles[i].set_color('gray')
+            titles[i].set_fontweight('normal')
+
+    if highlighted_point:
+        highlighted_point.remove()
+    highlighted_point = ax_umap.scatter(x, y, marker='+', color='black', s=150, lw=2.0, zorder=5)
+    
+    fig.canvas.draw_idle()
+
+fig.canvas.mpl_connect('button_press_event', update_dashboard)
+fig.canvas.mpl_connect('motion_notify_event', update_dashboard)
+
+# Увеличили нижний отступ (bottom=0.25), чтобы влезла легенда из 4 колонок
+plt.subplots_adjust(bottom=0.25, top=0.90, left=0.05, right=0.98, hspace=0.4, wspace=0.1)
+print("Готово! Дашборд запущен. Кликните или ведите мышь по UMAP.")
+plt.show()
+
+# %%
+# =============================================================================
+# 8. ИНТЕРАКТИВНАЯ КАРТА ГРАДИЕНТОВ В ПРОСТРАНСТВЕ UMAP
+# =============================================================================
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+import matplotlib.patheffects as pe
+
+print("Расчет векторных полей градиентов для латентного пространства...")
+
+# 1. Отбираем топ-N источников (как в прошлом скрипте)
+power_variances = np.var(powers, axis=0)
+top_n = min(15, N_patterns)
+top_indices = np.argsort(power_variances)[::-1][:top_n]
+
+# 2. Создаем регулярную сетку поверх пространства UMAP
+grid_resolution = 25 # Количество стрелок по осям X и Y
+margin = 1.0
+x_min, x_max = umap_coords[:, 0].min() - margin, umap_coords[:, 0].max() + margin
+y_min, y_max = umap_coords[:, 1].min() - margin, umap_coords[:, 1].max() + margin
+
+X_grid, Y_grid = np.meshgrid(
+    np.linspace(x_min, x_max, grid_resolution),
+    np.linspace(y_min, y_max, grid_resolution)
+)
+grid_points = np.c_[X_grid.ravel(), Y_grid.ravel()].astype(np.float32)
+
+# 3. ПРЕДСКАЗЫВАЕМ ПАРАМЕТРЫ ДЛЯ ВСЕЙ СЕТКИ
+# Прогоняем сетку координат через декодер
+hidden_grid = hidden_features_model.predict(grid_points, verbose=0)
+z_grid_flat = spatial_decoder_layer.z_dense(hidden_grid).numpy()
+
+# Восстанавливаем форму 3D: (Y_resolution, X_resolution, N_patterns)
+Z_3D = z_grid_flat.reshape(grid_resolution, grid_resolution, N_patterns)
+
+# 4. ВЫЧИСЛЯЕМ ГРАДИЕНТЫ ДЛЯ ВСЕХ ИСТОЧНИКОВ
+# Мы берем градиент от z (логарифма мощности), так как градиент самой мощности exp(z) 
+# будет слишком экстремальным (стрелки будут либо огромными, либо невидимыми).
+# Градиент от z показывает ровное и понятное направление роста.
+dZ_dY, dZ_dX = np.gradient(Z_3D, axis=(0, 1))
+
+# =============================================================================
+# ПОДГОТОВКА ИНТЕРФЕЙСА
+# =============================================================================
+active_sources = set() # Здесь храним индексы выбранных источников
+source_colors = plt.cm.tab20.colors # Палитра для стрелок разных источников
+
+# Настройка сетки графика
+N_COLS_TOPO = 3
+N_ROWS_TOPO = int(np.ceil(top_n / N_COLS_TOPO))
+
+fig = plt.figure(figsize=(18, max(8, 2 * N_ROWS_TOPO)))
+gs = GridSpec(N_ROWS_TOPO, N_COLS_TOPO + 2, width_ratios=[3.0, 0.2] + [1]*N_COLS_TOPO)
+
+# Левая панель (UMAP с градиентами)
+ax_umap = fig.add_subplot(gs[:, 0])
+
+# Подготовка базовых цветов для фона
+unique_classes = list(np.unique(labels))
+class_to_id = {lab: i + 1 for i, lab in enumerate(unique_classes)}
+cmap_bg = plt.cm.Pastel1
+color_map_bg = {lab: cmap_bg(i % 9) for i, lab in enumerate(unique_classes)}
+point_colors_bg = [color_map_bg[lab] for lab in labels]
+
+# Правая панель (Кнопки-топомапы)
+mne_info = raw.info 
+ax_buttons = {}  # Связь: ось -> индекс источника
+overlays = {}    # Связь: индекс источника -> белый прямоугольник (затемнение)
+borders = {}     # Связь: индекс источника -> цветная рамка
+
+for i, comp_idx in enumerate(top_indices):
+    row = i // N_COLS_TOPO
+    col = 2 + i % N_COLS_TOPO
+    ax = fig.add_subplot(gs[row, col])
+    
+    mne.viz.plot_topomap(found_patterns[comp_idx], mne_info, axes=ax, show=False, contours=0)
+    
+    # Затемняющий слой (активен, когда источник НЕ выбран)
+    overlay = plt.Rectangle((0, 0), 1, 1, transform=ax.transAxes, color='white', alpha=0.75, zorder=10)
+    ax.add_patch(overlay)
+    overlays[comp_idx] = overlay
+    
+    # Цветная рамка (скрыта по умолчанию)
+    border_color = source_colors[i % len(source_colors)]
+    for spine in ax.spines.values():
+        spine.set_edgecolor(border_color)
+        spine.set_linewidth(4)
+        spine.set_visible(False)
+    borders[comp_idx] = ax.spines
+    
+    ax.set_title(f"Ист. {comp_idx+1}", fontsize=11, fontweight='bold')
+    # Делаем оси кликабельными
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax_buttons[ax] = (comp_idx, border_color)
+
+# =============================================================================
+# ЛОГИКА ОТРИСОВКИ UMAP
+# =============================================================================
+def draw_umap_gradients():
+    ax_umap.clear()
+    
+    # 1. Рисуем тусклый фон из реальных эпох
+    ax_umap.scatter(umap_coords[:, 0], umap_coords[:, 1], c=point_colors_bg, 
+                    s=15, alpha=0.15, edgecolors='none', zorder=1)
+    
+    # 2. Рисуем центроиды
+    for lab in unique_classes:
+        mask = (labels == lab)
+        if not np.any(mask): continue
+        cx, cy = np.mean(umap_coords[mask], axis=0)
+        ax_umap.scatter(cx, cy, marker='*', s=300, facecolor=color_map_bg[lab], 
+                        edgecolor='gray', linewidths=0.5, zorder=2, alpha=0.5)
+        ax_umap.text(cx, cy, str(class_to_id[lab]), fontsize=10, color='gray', 
+                     ha='center', va='center', zorder=3)
+
+    # 3. РИСУЕМ ГРАДИЕНТЫ ДЛЯ ВЫБРАННЫХ ИСТОЧНИКОВ
+    for comp_idx, color in active_sources:
+        # Извлекаем сетку dx и dy для конкретного источника
+        U = dZ_dX[:, :, comp_idx]
+        V = dZ_dY[:, :, comp_idx]
+        
+        # Отрисовываем векторное поле
+        ax_umap.quiver(X_grid, Y_grid, U, V, color=color, 
+                       alpha=0.9, scale_units='xy', angles='xy', 
+                       headwidth=4, headlength=5, width=0.003, zorder=5)
+
+    ax_umap.set_title("Векторные поля градиентов мощности (∇z)", fontsize=14, fontweight='bold')
+    ax_umap.set_xlabel("UMAP 1")
+    ax_umap.set_ylabel("UMAP 2")
+    ax_umap.grid(True, linestyle='--', alpha=0.3)
+    ax_umap.set_xlim(x_min, x_max)
+    ax_umap.set_ylim(y_min, y_max)
+    
+    fig.canvas.draw_idle()
+
+# Первичная отрисовка
+draw_umap_gradients()
+
+# =============================================================================
+# ОБРАБОТЧИК КЛИКОВ ПО КНОПКАМ-ТОПОМАПАМ
+# =============================================================================
+def on_click(event):
+    if event.inaxes not in ax_buttons:
+        return
+        
+    comp_idx, color = ax_buttons[event.inaxes]
+    source_tuple = (comp_idx, color)
+    
+    # Тоггл: добавляем или удаляем источник
+    if source_tuple in active_sources:
+        active_sources.remove(source_tuple)
+        # Возвращаем затенение, скрываем рамку
+        overlays[comp_idx].set_alpha(0.75)
+        for spine in borders[comp_idx].values(): spine.set_visible(False)
+    else:
+        active_sources.add(source_tuple)
+        # Убираем затенение, показываем цветную рамку
+        overlays[comp_idx].set_alpha(0.0)
+        for spine in borders[comp_idx].values(): spine.set_visible(True)
+            
+    # Перерисовываем основной график
+    draw_umap_gradients()
+
+fig.canvas.mpl_connect('button_press_event', on_click)
+
+plt.subplots_adjust(left=0.05, right=0.98, bottom=0.1, top=0.92, wspace=0.1, hspace=0.3)
+print("Готово! Кликайте по топомапам справа, чтобы включать/выключать их векторные поля на UMAP.")
+plt.show()
+
+# %%
+# =============================================================================
+# 8. ИНТЕРАКТИВНАЯ КАРТА ГРАДИЕНТОВ И СМЕШАННОЙ ТОПОГРАФИИ
+# =============================================================================
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from matplotlib.lines import Line2D
+import matplotlib.patheffects as pe
+import matplotlib.colors as mcolors
+
+print("Расчет векторных полей и подготовка топографии для латентного пространства...")
+
+# 1. Отбираем топ-N источников
+power_variances = np.var(powers, axis=0)
+top_n = min(15, N_patterns)
+top_indices = np.argsort(power_variances)[::-1][:top_n]
+
+# 2. Создаем регулярную сетку
+grid_resolution = 25
+margin = 1.0
+x_min, x_max = umap_coords[:, 0].min() - margin, umap_coords[:, 0].max() + margin
+y_min, y_max = umap_coords[:, 1].min() - margin, umap_coords[:, 1].max() + margin
+
+X_grid, Y_grid = np.meshgrid(
+    np.linspace(x_min, x_max, grid_resolution),
+    np.linspace(y_min, y_max, grid_resolution)
+)
+grid_points = np.c_[X_grid.ravel(), Y_grid.ravel()].astype(np.float32)
+
+# 3. Предсказываем параметры
+hidden_grid = hidden_features_model.predict(grid_points, verbose=0)
+z_grid_flat = spatial_decoder_layer.z_dense(hidden_grid).numpy()
+Z_3D = z_grid_flat.reshape(grid_resolution, grid_resolution, N_patterns)
+
+# 4. Градиенты
+dZ_dY, dZ_dX = np.gradient(Z_3D, axis=(0, 1))
+
+# =============================================================================
+# ПОДГОТОВКА ИНТЕРФЕЙСА И ЦВЕТОВ
+# =============================================================================
+active_sources = set()
+
+# Максимально контрастные цвета для источников (палитра Келли)
+distinct_colors = [
+    '#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', 
+    '#911eb4', '#42d4f4', '#f032e6', '#bfef45', '#fabed4', 
+    '#469990', '#dcbeff', '#9A6324', '#fffac8', '#800000'
+]
+source_colors = distinct_colors[:top_n]
+
+N_COLS_TOPO = 3
+N_ROWS_TOPO = int(np.ceil(top_n / N_COLS_TOPO))
+
+fig = plt.figure(figsize=(18, max(8, 2 * N_ROWS_TOPO)))
+gs = GridSpec(N_ROWS_TOPO, N_COLS_TOPO + 2, width_ratios=[3.0, 0.2] + [1]*N_COLS_TOPO)
+
+ax_umap = fig.add_subplot(gs[:, 0])
+
+# --- СОХРАНЯЕМ ПОРЯДОК ИЗ ВАШЕГО СПИСКА new_descriptions ---
+unique_classes = []
+for lab in new_descriptions:
+    if lab in labels and lab not in unique_classes:
+        unique_classes.append(lab)
+# На случай, если в labels есть что-то непредвиденное
+for lab in labels:
+    if lab not in unique_classes:
+        unique_classes.append(lab)
+
+class_to_id = {lab: i + 1 for i, lab in enumerate(unique_classes)}
+cmap_bg = plt.cm.tab20
+color_map_bg = {lab: cmap_bg(i / max(1, len(unique_classes) - 1)) for i, lab in enumerate(unique_classes)}
+point_colors_bg = [color_map_bg[lab] for lab in labels]
+
+mne_info = raw.info 
+ax_buttons = {}  
+overlays = {}    
+borders = {}     
+
+for i, comp_idx in enumerate(top_indices):
+    row = i // N_COLS_TOPO
+    col = 2 + i % N_COLS_TOPO
+    ax = fig.add_subplot(gs[row, col])
+    
+    mne.viz.plot_topomap(found_patterns[comp_idx], mne_info, axes=ax, show=False, contours=0)
+    
+    overlay = plt.Rectangle((0, 0), 1, 1, transform=ax.transAxes, color='white', alpha=0.75, zorder=10)
+    ax.add_patch(overlay)
+    overlays[comp_idx] = overlay
+    
+    border_color = source_colors[i % len(source_colors)]
+    for spine in ax.spines.values():
+        spine.set_edgecolor(border_color)
+        spine.set_linewidth(4)
+        spine.set_visible(False)
+    borders[comp_idx] = ax.spines
+    
+    ax.set_title(f"Ист. {comp_idx+1}", fontsize=11, fontweight='bold')
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax_buttons[ax] = (comp_idx, border_color)
+
+# =============================================================================
+# ЛОГИКА ОТРИСОВКИ UMAP СО СМЕШИВАНИЕМ ТОПОГРАФИЙ И Z-ORDER
+# =============================================================================
+def draw_umap_gradients():
+    ax_umap.clear()
+    
+    # 1. РИСУЕМ ФОНОВУЮ ТОПОГРАФИЮ (САМЫЙ НИЖНИЙ СЛОЙ)
+    for comp_idx, color in active_sources:
+        Z_comp = Z_3D[:, :, comp_idx]
+        
+        # Создаем кастомную палитру: от прозрачного до цвета источника
+        rgba = mcolors.to_rgba(color)
+        color_transparent = (rgba[0], rgba[1], rgba[2], 0.0)
+        color_solid = (rgba[0], rgba[1], rgba[2], 0.55)
+        custom_cmap = mcolors.LinearSegmentedColormap.from_list(f'cmap_{comp_idx}', [color_transparent, color_solid])
+        
+        # zorder=1 (дно)
+        ax_umap.contourf(X_grid, Y_grid, Z_comp, levels=15, cmap=custom_cmap, zorder=1)
+
+    # 2. РИСУЕМ ТОЧКИ ЭПОХ ПОВЕРХ ТОПОГРАФИИ, НО ПОД СТРЕЛКАМИ
+    # zorder=3 
+    ax_umap.scatter(umap_coords[:, 0], umap_coords[:, 1], c=point_colors_bg, 
+                    s=25, alpha=0.5, edgecolors='white', linewidths=0.3, zorder=3)
+
+    # 3. РИСУЕМ СТРЕЛКИ ДЛЯ АКТИВНЫХ ИСТОЧНИКОВ ПОВЕРХ ТОЧЕК
+    for comp_idx, color in active_sources:
+        U = dZ_dX[:, :, comp_idx]
+        V = dZ_dY[:, :, comp_idx]
+        
+        # color - цвет заливки, edgecolors - контур стрелки
+        # zorder=4 (над точками)
+        ax_umap.quiver(X_grid, Y_grid, U, V, 
+                       color=color, edgecolors='black', linewidths=0.5,
+                       alpha=0.95, scale_units='xy', angles='xy', 
+                       headwidth=4, headlength=5, width=0.003, zorder=4)
+
+    # 4. РИСУЕМ ЦЕНТРОИДЫ И ИХ ПОДПИСИ (САМЫЙ ВЕРХНИЙ СЛОЙ)
+    for lab in unique_classes:
+        mask = (labels == lab)
+        if not np.any(mask): continue
+        cx, cy = np.mean(umap_coords[mask], axis=0)
+        
+        # zorder=5 (над стрелками)
+        ax_umap.scatter(cx, cy, marker='*', s=350, facecolor=color_map_bg[lab], 
+                        edgecolor='black', linewidths=0.8, zorder=5, alpha=0.95)
+        
+        # zorder=6 (текст всегда на самом верху)
+        ax_umap.text(cx, cy, str(class_to_id[lab]), fontsize=11, color='white', 
+                     fontweight='bold', ha='center', va='center', zorder=6,
+                     path_effects=[pe.withStroke(linewidth=2.5, foreground="black")])
+
+    # 5. ДОБАВЛЕНИЕ ЛЕГЕНДЫ ДЛЯ КЛАССОВ (в правильном порядке)
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='w', label=f"{class_to_id[lab]}: {lab}",
+               markerfacecolor=color_map_bg[lab], markersize=8, 
+               markeredgecolor='black', markeredgewidth=0.5) 
+        for lab in unique_classes
+    ]
+    ax_umap.legend(handles=legend_elements, title="Условия / Классы", loc='upper center', 
+                   bbox_to_anchor=(0.5, -0.08), ncol=6, fontsize=9, title_fontsize=10)
+
+    # Оформление
+    ax_umap.set_title("Смешанная топография мощностей и градиенты (∇z)", fontsize=14, fontweight='bold')
+    ax_umap.set_xlabel("UMAP 1")
+    ax_umap.set_ylabel("UMAP 2")
+    ax_umap.grid(True, linestyle='--', alpha=0.3, zorder=0)
+    ax_umap.set_xlim(x_min, x_max)
+    ax_umap.set_ylim(y_min, y_max)
+    
+    fig.canvas.draw_idle()
+
+# Первичная отрисовка
+draw_umap_gradients()
+
+# =============================================================================
+# ОБРАБОТЧИК КЛИКОВ ПО КНОПКАМ-ТОПОМАПАМ
+# =============================================================================
+def on_click(event):
+    if event.inaxes not in ax_buttons:
+        return
+        
+    comp_idx, color = ax_buttons[event.inaxes]
+    source_tuple = (comp_idx, color)
+    
+    if source_tuple in active_sources:
+        active_sources.remove(source_tuple)
+        overlays[comp_idx].set_alpha(0.75)
+        for spine in borders[comp_idx].values(): spine.set_visible(False)
+    else:
+        active_sources.add(source_tuple)
+        overlays[comp_idx].set_alpha(0.0)
+        for spine in borders[comp_idx].values(): spine.set_visible(True)
+            
+    draw_umap_gradients()
+
+fig.canvas.mpl_connect('button_press_event', on_click)
+
+# Увеличили bottom до 0.18, чтобы вместить легенду
+plt.subplots_adjust(left=0.05, right=0.98, bottom=0.18, top=0.92, wspace=0.1, hspace=0.3)
+print("Готово! Выбирайте несколько источников: их топографии мощности будут смешиваться в пространстве UMAP.")
 plt.show()
