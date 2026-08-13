@@ -52,7 +52,7 @@ w_step_sec = 0.25
 baseline_window = (-1.0, 0.0) # Окно для бейзлайна ERD/ERS (в секундах)
 event_time = 0.0              # Время стимула/начала движения
 
-label_mode = 'categorical_binary' # Новый режим
+label_mode = 'categorical_binary' 
 
 # %%
 # -----------------------------------------------------------------
@@ -257,6 +257,7 @@ for it in range(n_iters):
         
         dist_matrix = pairwise_distance(C_current, metric='riemann')
 
+# %%
 # %
 # -----------------------------------------------------------------
 # 6. РАСЧЕТ ПРОФИЛЕЙ (ERD/ERS ПО УСЛОВИЯМ)
