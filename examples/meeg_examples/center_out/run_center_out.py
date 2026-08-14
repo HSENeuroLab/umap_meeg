@@ -169,10 +169,10 @@ covmats_ssd = Covariances().fit_transform(all_windows_ssd / np.std(all_windows_s
 covmats = Covariances().fit_transform(all_windows / np.std(all_windows))
 
 # print("Отбеливание ковариационных матриц по среднему арифметическому...")
-C_avg = np.mean(covmats_ssd, axis=0)                     
-C_avg_invsqrt = invsqrtm(C_avg)                       
-C_avg_sqrt = np.linalg.inv(C_avg_invsqrt)             
-covmats_white = C_avg_invsqrt @ covmats_ssd @ C_avg_invsqrt
+# C_avg = np.mean(covmats_ssd, axis=0)                     
+# C_avg_invsqrt = invsqrtm(C_avg)                       
+# C_avg_sqrt = np.linalg.inv(C_avg_invsqrt)             
+# covmats_white = C_avg_invsqrt @ covmats_ssd @ C_avg_invsqrt
 
 # %%
 # -----------------------------------------------------------------
@@ -183,86 +183,104 @@ dist_matrix = pairwise_distance(C_current, metric='riemann')
 dist_matrix_init = dist_matrix.copy()
 
 # %%
-from pyriemann.tangentspace import TangentSpace
 import tensorflow as tf
 from umap.parametric_umap import ParametricUMAP
 import numpy as np
+import mne
 
-n_ch_white = covmats.shape[1]
-
-# =============================================================================
-# ПОДГОТОВКА ДАННЫХ
-# =============================================================================
-# Нормализация жизненно необходима, чтобы обучаемый шум стартовал в адекватном масштабе
-X_cov_flat = covmats.reshape(covmats.shape[0], -1).astype(np.float32)
-input_dim = X_cov_flat.shape[1]
+# Предполагается, что covmats уже существует, форма (n_epochs, M, M)
+M = covmats.shape[1]
 
 # =============================================================================
-# ДЕКОДЕР С ОБУЧАЕМЫМ НЕСФЕРИЧНЫМ ШУМОМ
+# 1. ПОДГОТОВКА ДАННЫХ (ТОЛЬКО ВЕРХНИЙ ТРЕУГОЛЬНИК)
+# =============================================================================
+# Получаем индексы верхнего треугольника (включая главную диагональ)
+triu_row, triu_col = np.triu_indices(M)
+
+# Вытягиваем только уникальные значения
+X_cov_triu = covmats[:, triu_row, triu_col].astype(np.float32)
+input_dim = X_cov_triu.shape[1] # Это будет M * (M + 1) / 2
+
+print(f"Размерность входа уменьшена с {M*M} до {input_dim}")
+
+# =============================================================================
+# 2. УМНЫЕ ИНДЕКСЫ ДЛЯ БЫСТРОЙ РЕКОНСТРУКЦИИ В TENSORFLOW
+# =============================================================================
+# А) Индексы, чтобы собрать симметричную матрицу M x M из triu-вектора (для Loss)
+idx_sym = np.zeros((M, M), dtype=int)
+idx_sym[triu_row, triu_col] = np.arange(input_dim)
+idx_sym = np.maximum(idx_sym, idx_sym.T) # Отражаем симметрично
+idx_sym_flat = idx_sym.flatten()         # Плоский массив индексов
+
+# Б) Индексы, чтобы вытащить triu-вектор из плоской матрицы M x M (для Декодера)
+flat_triu_indices = np.ravel_multi_index((triu_row, triu_col), (M, M))
+
+# =============================================================================
+# 3. ДЕКОДЕР С ДИНАМИЧЕСКИМ ШУМОМ (TWO-HEADED)
 # =============================================================================
 class SpatialPatternDecoder(tf.keras.layers.Layer):
-    def __init__(self, M_channels, N_patterns, **kwargs):
+    def __init__(self, M_channels, N_patterns, flat_triu_indices, **kwargs):
         super().__init__(**kwargs)
         self.M_channels = M_channels
         self.N_patterns = N_patterns
+        self.flat_triu_indices = flat_triu_indices
 
     def build(self, input_shape):
-        # 1. Обучаемые паттерны (матрица A)
         self.A = self.add_weight(
             shape=(self.M_channels, self.N_patterns),
             initializer=tf.keras.initializers.RandomNormal(stddev=0.1),
             trainable=True,
             name="A_patterns"
         )
-        
-        # 2. ОБУЧАЕМЫЙ ГЛОБАЛЬНЫЙ ШУМ (индивидуальный для каждого сенсора)
-        # Инициализируем отрицательным значением, чтобы после softplus шум стартовал с малого значения
-        self.noise_log = self.add_weight(
-            shape=(self.M_channels,),
-            initializer=tf.keras.initializers.Constant(-3.0),
-            trainable=True,
-            name="sensor_noise"
-        )
 
-    def call(self, z):
-        # Нормализуем столбцы A
+    def call(self, z_combined):
+        # 1. Расщепляем вектор на мощности источников и мощности шума
+        z_signal = z_combined[:, :self.N_patterns]
+        z_noise = z_combined[:, self.N_patterns:]
+        
+        # 2. Нормализуем столбцы A
         A_norm = tf.math.l2_normalize(self.A, axis=0)
         
-        P = tf.exp(z)
-        
-        # Реконструкция полезного сигнала: A * P * A^T
+        # 3. Сигнальная часть (A * P * A^T)
+        P = tf.exp(z_signal)
         C_signal = tf.einsum("mf,bf,lf->bml", A_norm, P, A_norm)
         
-        # Превращаем обучаемый вектор в строго положительную дисперсию (через softplus)
-        noise_variance = tf.math.softplus(self.noise_log)
-        
-        # Создаем диагональную матрицу шума
+        # 4. Шумовая часть (Диагональная матрица D_t)
+        # Используем softplus (или exp), чтобы дисперсия шума была положительной
+        noise_variance = tf.exp(z_noise) 
         noise_diag = tf.linalg.diag(noise_variance)
         
-        # Итоговая ковариация: Сигнал + Глобальный несферичный шум
+        # 5. Итоговая ковариация
         C_recon = C_signal + noise_diag
-        return C_recon
+        
+        # 6. ВАЖНО: Выдаем наружу только верхний треугольник, 
+        # чтобы размерность совпала со входом энкодера для UMAP
+        flat_C = tf.reshape(C_recon, [-1, self.M_channels * self.M_channels])
+        C_recon_triu = tf.gather(flat_C, self.flat_triu_indices, axis=1)
+        
+        return C_recon_triu
     
-def riemannian_distance_loss(y_true_flat, y_pred_flat):
-    y_true_flat = tf.cast(y_true_flat, tf.float32)
-    y_pred_flat = tf.cast(y_pred_flat, tf.float32)
+# =============================================================================
+# 4. РИМАНОВА ФУНКЦИЯ ПОТЕРЬ (С ВОССТАНОВЛЕНИЕМ СИММЕТРИИ)
+# =============================================================================
+def riemannian_distance_loss(y_true_triu, y_pred_triu):
+    y_true_triu = tf.cast(y_true_triu, tf.float32)
+    y_pred_triu = tf.cast(y_pred_triu, tf.float32)
 
-    M = n_ch_white  
+    C_true_flat = tf.gather(y_true_triu, idx_sym_flat, axis=1)
+    C_pred_flat = tf.gather(y_pred_triu, idx_sym_flat, axis=1)
     
-    C_true = tf.reshape(y_true_flat, [-1, M, M])
-    C_pred = tf.reshape(y_pred_flat, [-1, M, M])
+    C_true = tf.reshape(C_true_flat, [-1, M, M])
+    C_pred = tf.reshape(C_pred_flat, [-1, M, M])
     
     smoothing_factor = 1e-2  
     eye_M = tf.eye(M, dtype=tf.float32)
     
-    # Добавляем сглаживание к матрицам
     C_true_reg = C_true + smoothing_factor * eye_M
     C_pred_reg = C_pred + smoothing_factor * eye_M
 
-    # Защитная константа для стабильности градиентов
     eps = 1e-7
 
-    # Риманово расстояние
     eigvals_true, eigvecs_true = tf.linalg.eigh(C_true_reg)
     inv_sqrt_eigvals = 1.0 / tf.sqrt(tf.maximum(eigvals_true, eps))
     C_true_invsqrt = tf.einsum('bij,bj,bkj->bik', eigvecs_true, inv_sqrt_eigvals, eigvecs_true)
@@ -278,33 +296,28 @@ def riemannian_distance_loss(y_true_flat, y_pred_flat):
     return tf.reduce_mean(dist_sq)
 
 # =============================================================================
-# ПОДГОТОВКА ДАННЫХ
+# 5. СБОРКА И ОБУЧЕНИЕ МОДЕЛИ
 # =============================================================================
-N_patterns = 20  # Количество источников
-N_dim = N_patterns  
+N_patterns = 15  # Количество полезных источников
+N_noise = M      # Оси шума (по одной на каждый канал)
+N_dim = N_patterns + N_noise  # Итоговая размерность вложения!
 
-# =============================================================================
-# ЭНКОДЕР И ДЕКОДЕР (С ОРТОГОНАЛЬНОСТЬЮ)
-# =============================================================================
-# Энкодер переводит матрицу напрямую в 5 мощностей (z)
+# Энкодер теперь выдает объединенный вектор: [полезные_мощности, шум_сенсоров]
 encoder = tf.keras.Sequential([
     tf.keras.layers.InputLayer(shape=(input_dim,)),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(N_dim, activation="linear", name="z_powers")
+    tf.keras.layers.Dense(128, activation="relu"),
+    tf.keras.layers.Dense(128, activation="relu"),
+    tf.keras.layers.Dense(128, activation="relu"),
+    tf.keras.layers.Dense(N_dim, activation="linear", name="z_combined")
 ])
 
 decoder = tf.keras.Sequential([
     tf.keras.layers.InputLayer(shape=(N_dim,)),
-    SpatialPatternDecoder(M_channels=n_ch_white, N_patterns=N_patterns, name="spatial_decoder"),
-    tf.keras.layers.Flatten()
+    SpatialPatternDecoder(M_channels=M, N_patterns=N_patterns, 
+                          flat_triu_indices=flat_triu_indices, name="spatial_decoder")
 ])
 
-# =============================================================================
-# ОБУЧЕНИЕ PARAMETRIC UMAP
-# =============================================================================
-print(f"Обучение ParametricUMAP: N_dim={N_dim}, N_patterns={N_patterns}")
+print(f"Обучение ParametricUMAP: N_dim={N_dim} ({N_patterns} источников + {N_noise} осей шума)")
 
 embedder = ParametricUMAP(
     encoder=encoder,
@@ -318,22 +331,23 @@ embedder = ParametricUMAP(
     verbose=True
 )
 
-# Обучаем: сеть балансирует между сохранением Риманова графа (UMAP) и реконструкцией матриц (Декодер)
-embedder.fit(X_cov_flat, precomputed_distances=dist_matrix_init,
-             # epochs=5,
-             # steps_per_epoch=steps_per_epoch
-             )
+# Обучаем модель! 
+# Теперь X_cov_triu используется и как вход энкодера, и как таргет для реконструкции.
+embedder.fit(X_cov_triu, precomputed_distances=dist_matrix_init)
 
 # =============================================================================
-# КАК СДЕЛАТЬ 2D КЛИКЕР ТЕПЕРЬ?
+# 6. КЛИКЕР: ПРОЕКЦИЯ ДЛЯ ИНТЕРФЕЙСА (ХИТРОСТЬ!)
 # =============================================================================
-# embedder.embedding_ сейчас имеет размерность (n_windows, 5)
-# Чтобы сделать красивый 2D-дашборд для кликера, мы просто проецируем эти готовые, 
-# физиологически осмысленные 5D точки на плоскость с помощью обычного UMAP:
+# В embedder.embedding_ сейчас лежат N_patterns + M осей.
+# UMAP строил свой граф с учетом шума (как ты и просил).
+# Но для визуализации состояний мозга нам логично рисовать 2D проекцию 
+# ТОЛЬКО на основе полезных мощностей (отбрасывая оси шума).
 
-# print("Проекция мощностей в 2D для интерфейса...")
-reducer_2d = umap.UMAP(n_components=2, metric='euclidean', random_state=42)
-umap_coords = reducer_2d.fit_transform(embedder.embedding_)
+print("Проекция ТОЛЬКО полезных мощностей в 2D для кликера...")
+z_signal_only = embedder.embedding_[:, :N_patterns] # Берем только первые 20 осей
+
+reducer_2d = umap.UMAP(n_components=2)
+umap_coords = reducer_2d.fit_transform(z_signal_only)
 
 # %%
 # =============================================================================
@@ -343,10 +357,10 @@ import matplotlib as mpl
 
 # 1. Извлекаем сырые значения z (логарифмы мощностей) 
 # Теперь выход энкодера — это и есть наше пространство источников!
-z_values = embedder.encoder.predict(X_cov_flat)   # Размерность: (n_windows, N_patterns)
+z_values = embedder.encoder.predict(X_cov_triu)   # Размерность: (n_windows, N_patterns)
 
 # 2. Переводим в реальные мощности
-powers = np.exp(z_values)
+powers = np.exp(z_values[:, :N_patterns])
 
 # 3. Извлекаем матрицу паттернов и нормируем 
 spatial_decoder_layer = embedder.decoder.get_layer("spatial_decoder")
@@ -422,6 +436,71 @@ for comp_idx in range(N_patterns):
     erd_profiles_dict.append(comp_erd)
     erd_filt_profiles_dict.append(comp_filt_erd)
 
+# %%
+# =============================================================================
+# 7.5 РАСЧЕТ И ВИЗУАЛИЗАЦИЯ ДИНАМИКИ ШУМА (СЕНСОРНЫЕ ОСЦИЛЛЯЦИИ ПО КАНАЛАМ)
+# =============================================================================
+print("\nИзвлечение временных профилей аппаратного/декоррелированного шума по каждому каналу...")
+
+# 1. Извлекаем сырые значения шума из латентного пространства
+z_noise_raw = z_values[:, N_patterns:]
+
+# 2. Переводим через softplus (как в SpatialPatternDecoder)
+powers_noise = np.log(1 + np.exp(z_noise_raw))
+
+# 3. Меняем форму под трайлы и окна
+# Размерность: (n_trials, num_windows_per_trial, M_channels)
+powers_noise_reshaped = powers_noise.reshape(n_trials, num_windows_per_trial, M)
+
+# 4. Настройка сетки графиков (Subplots)
+n_cols = 5  # Количество колонок в сетке
+n_rows = int(np.ceil(M / n_cols))
+
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 3 * n_rows), sharex=True)
+axes = axes.flatten()  # Переводим в 1D массив для удобного цикла
+
+# 5. Отрисовка динамики для КАЖДОГО канала
+for ch_idx in range(M):
+    ax = axes[ch_idx]
+    ch_name = info.ch_names[ch_idx] if 'info' in locals() else f"Ch {ch_idx+1}"
+    
+    # Отрисовка стимула и бейзлайна
+    ax.axvspan(baseline_window[0], baseline_window[1], color='gray', alpha=0.2, zorder=0)
+    ax.axvline(event_time, color='black', linestyle='--', alpha=0.7, zorder=1)
+    
+    # Отрисовка профилей по условиям
+    for cond in conditions:
+        cond_mask = (trial_cond_labels == cond)
+        # Извлекаем шум только для ТЕКУЩЕГО канала (ch_idx)
+        cond_noise = powers_noise_reshaped[cond_mask, :, ch_idx]
+        
+        mean_noise = np.mean(cond_noise, axis=0)
+        se_noise = np.std(cond_noise, axis=0) / np.sqrt(np.sum(cond_mask))
+        
+        ax.plot(unique_window_times, mean_noise, color=cond_colors[cond], lw=1.5, zorder=3, label=cond)
+        ax.fill_between(unique_window_times, mean_noise - se_noise, mean_noise + se_noise, 
+                        color=cond_colors[cond], alpha=0.15, zorder=2)
+    
+    # Оформление каждого маленького графика
+    ax.set_title(f"Канал: {ch_name}", fontsize=11, fontweight='bold')
+    ax.grid(True, linestyle=':', alpha=0.6)
+    
+    # Оставляем легенду только на первом графике
+    if ch_idx == 0:
+        ax.legend(loc='upper right', fontsize=8)
+
+# 6. Отключаем пустые оси, если M не кратно n_cols
+for empty_ax_idx in range(M, len(axes)):
+    axes[empty_ax_idx].axis('off')
+    
+# 7. Подписи для нижнего ряда
+for ax in axes[-n_cols:]:
+    if ax.axis() != (0.0, 1.0, 0.0, 1.0):  # Если ось не выключена
+        ax.set_xlabel('Время (с)', fontsize=10)
+
+plt.suptitle('Динамика локального шума $D_t$ независимо по каждому каналу', fontsize=16, y=0.98, fontweight='bold')
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.show()
 
 # %%
 # =============================================================================
