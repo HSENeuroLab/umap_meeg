@@ -188,23 +188,19 @@ n_ch_white = covmats.shape[1]
 X_cov_flat = covmats.reshape(covmats.shape[0], -1).astype(np.float32)
 input_dim = X_cov_flat.shape[1]
 
-N_dim = 2          
-N_patterns = 20    
-
 # =============================================================================
 # ДЕКОДЕР С ОБУЧАЕМЫМ НЕСФЕРИЧНЫМ ШУМОМ
 # =============================================================================
 class SpatialPatternDecoder(tf.keras.layers.Layer):
-    def __init__(self, M_channels, **kwargs):
+    def __init__(self, M_channels, N_patterns, **kwargs):
         super().__init__(**kwargs)
         self.M_channels = M_channels
+        self.N_patterns = N_patterns
 
     def build(self, input_shape):
-        n_filters = input_shape[-1]
-        
         # 1. Обучаемые паттерны (матрица A)
         self.A = self.add_weight(
-            shape=(self.M_channels, n_filters),
+            shape=(self.M_channels, self.N_patterns),
             initializer=tf.keras.initializers.RandomNormal(stddev=0.1),
             trainable=True,
             name="A_patterns"
@@ -220,7 +216,9 @@ class SpatialPatternDecoder(tf.keras.layers.Layer):
         )
 
     def call(self, z):
+        # Нормализуем столбцы A
         A_norm = tf.math.l2_normalize(self.A, axis=0)
+        
         P = tf.exp(z)
         
         # Реконструкция полезного сигнала: A * P * A^T
@@ -235,7 +233,7 @@ class SpatialPatternDecoder(tf.keras.layers.Layer):
         # Итоговая ковариация: Сигнал + Глобальный несферичный шум
         C_recon = C_signal + noise_diag
         return C_recon
-
+    
 def riemannian_distance_loss(y_true_flat, y_pred_flat):
     y_true_flat = tf.cast(y_true_flat, tf.float32)
     y_pred_flat = tf.cast(y_pred_flat, tf.float32)
@@ -245,8 +243,6 @@ def riemannian_distance_loss(y_true_flat, y_pred_flat):
     C_true = tf.reshape(y_true_flat, [-1, M, M])
     C_pred = tf.reshape(y_pred_flat, [-1, M, M])
     
-    # СГЛАЖИВАНИЕ МНОГООБРАЗИЯ (Riemannian Smoothing)
-    # Защищает метрику от взрыва на направлениях с нулевой дисперсией (например, после Average Reference)
     smoothing_factor = 1e-2  
     eye_M = tf.eye(M, dtype=tf.float32)
     
@@ -273,34 +269,38 @@ def riemannian_distance_loss(y_true_flat, y_pred_flat):
     return tf.reduce_mean(dist_sq)
 
 # =============================================================================
-# СБОРКА МОДЕЛЕЙ
+# ПОДГОТОВКА ДАННЫХ
 # =============================================================================
+N_patterns = 20  # Количество источников
+N_dim = N_patterns  
+
+# =============================================================================
+# ЭНКОДЕР И ДЕКОДЕР (С ОРТОГОНАЛЬНОСТЬЮ)
+# =============================================================================
+# Энкодер переводит матрицу напрямую в 5 мощностей (z)
 encoder = tf.keras.Sequential([
     tf.keras.layers.InputLayer(shape=(input_dim,)),
     tf.keras.layers.Dense(100, activation="relu"),
     tf.keras.layers.Dense(100, activation="relu"),
     tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(N_dim, activation="linear", name="umap_embedding")
+    tf.keras.layers.Dense(N_dim, activation="linear", name="z_powers")
 ])
 
 decoder = tf.keras.Sequential([
     tf.keras.layers.InputLayer(shape=(N_dim,)),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(N_patterns, activation="linear", name="z_layer"),
-    SpatialPatternDecoder(M_channels=n_ch_white, name="spatial_decoder"),
+    SpatialPatternDecoder(M_channels=n_ch_white, N_patterns=N_patterns, name="spatial_decoder"),
     tf.keras.layers.Flatten()
 ])
 
 # =============================================================================
-# ОБУЧЕНИЕ ParametricUMAP
+# ОБУЧЕНИЕ PARAMETRIC UMAP
 # =============================================================================
-print(f"Обучение с N_dim={N_dim}, N_patterns={N_patterns}")
+print(f"Обучение ParametricUMAP: N_dim={N_dim}, N_patterns={N_patterns}")
+
 embedder = ParametricUMAP(
     encoder=encoder,
     decoder=decoder,
-    n_components=N_dim,
+    n_components=N_dim, 
     dims=(input_dim,),
     metric="precomputed",
     parametric_reconstruction=True,
@@ -309,8 +309,22 @@ embedder = ParametricUMAP(
     verbose=True
 )
 
-embedder.fit(X_cov_flat, precomputed_distances=dist_matrix_init)
-umap_coords = embedder.embedding_
+# Обучаем: сеть балансирует между сохранением Риманова графа (UMAP) и реконструкцией матриц (Декодер)
+embedder.fit(X_cov_flat, precomputed_distances=dist_matrix_init,
+             # epochs=5,
+             # steps_per_epoch=steps_per_epoch
+             )
+
+# =============================================================================
+# КАК СДЕЛАТЬ 2D КЛИКЕР ТЕПЕРЬ?
+# =============================================================================
+# embedder.embedding_ сейчас имеет размерность (n_windows, 5)
+# Чтобы сделать красивый 2D-дашборд для кликера, мы просто проецируем эти готовые, 
+# физиологически осмысленные 5D точки на плоскость с помощью обычного UMAP:
+
+# print("Проекция мощностей в 2D для интерфейса...")
+reducer_2d = umap.UMAP(n_components=2, metric='euclidean', random_state=42)
+umap_coords = reducer_2d.fit_transform(embedder.embedding_)
 
 # %%
 # =============================================================================
@@ -318,221 +332,28 @@ umap_coords = embedder.embedding_
 # =============================================================================
 import matplotlib as mpl
 
-latent = embedder.encoder.predict(X_cov_flat)   # (n_windows, N_dim)
-
-# 1. Извлекаем сырые значения z (логарифмы мощностей)
-decoder_input = tf.keras.Input(shape=(N_dim,))
-x = decoder_input
-for layer in embedder.decoder.layers:
-    x = layer(x)
-    if layer.name == "z_layer":
-        break
-
-z_model = tf.keras.Model(inputs=decoder_input, outputs=x)
-z_values = z_model.predict(latent)              # (n_windows, N_patterns)
+# 1. Извлекаем сырые значения z (логарифмы мощностей) 
+# Теперь выход энкодера — это и есть наше пространство источников!
+z_values = embedder.encoder.predict(X_cov_flat)   # Размерность: (n_windows, N_patterns)
 
 # 2. Переводим в реальные мощности
 powers = np.exp(z_values)
 
 # 3. Извлекаем матрицу паттернов и нормируем 
 spatial_decoder_layer = embedder.decoder.get_layer("spatial_decoder")
+# Нулевой индекс весов — это матрица A. Первый индекс был бы шумом (noise_log).
 A_learned_raw = spatial_decoder_layer.get_weights()[0]
 A_global = A_learned_raw / np.linalg.norm(A_learned_raw, axis=0) 
 
 # ТЕПЕРЬ A_global - ЭТО И ЕСТЬ ГОТОВЫЕ ПАТТЕРНЫ В ПРОСТРАНСТВЕ СЕНСОРОВ!
 found_patterns = [A_global[:, i] for i in range(N_patterns)]
 
-# 5. Фильтры Хауфе (математика остается прежней)
+# 4. Фильтры Хауфе (математика остается прежней)
 C_global_mean = np.mean(covmats, axis=0)
 C_global_inv = np.linalg.pinv(C_global_mean)
 found_filters = [C_global_inv @ A_global[:, i] for i in range(N_patterns)]
 
-print("Модели обучены end-to-end, сырые паттерны и мощности извлечены.")
-
-# %%
-from pyriemann.tangentspace import TangentSpace
-import tensorflow as tf
-from umap.parametric_umap import ParametricUMAP
-import numpy as np
-
-n_ch_white = covmats.shape[1]
-
-# =============================================================================
-# ПОДГОТОВКА ДАННЫХ
-# =============================================================================
-# Нормализация жизненно необходима, чтобы обучаемый шум стартовал в адекватном масштабе
-X_cov_flat = covmats.reshape(covmats.shape[0], -1).astype(np.float32)
-input_dim = X_cov_flat.shape[1]
-
-N_dim = 2          
-N_patterns = 40    
-
-# =============================================================================
-# ДЕКОДЕР С ДИНАМИЧЕСКИМ ШУМОМ (ВНУТРЕННИЕ ПРОЕКЦИИ)
-# =============================================================================
-class SpatialPatternDecoder(tf.keras.layers.Layer):
-    def __init__(self, M_channels, N_patterns, **kwargs):
-        super().__init__(**kwargs)
-        self.M_channels = M_channels
-        self.N_patterns = N_patterns
-
-    def build(self, input_shape):
-        # input_shape здесь будет (None, N_dim), то есть 2D координаты UMAP
-        
-        # 1. Глобальные паттерны (Матрица A)
-        self.A = self.add_weight(
-            shape=(self.M_channels, self.N_patterns),
-            initializer=tf.keras.initializers.RandomNormal(stddev=0.1),
-            trainable=True,
-            name="A_patterns"
-        )
-        
-        # 2. Внутренний слой для генерации мощностей (z) из UMAP-координат
-        self.z_dense = tf.keras.layers.Dense(
-            units=self.N_patterns, 
-            activation="linear", 
-            name="z_projection"
-        )
-        
-        # 3. Внутренний слой для генерации шума из UMAP-координат
-        self.noise_dense = tf.keras.layers.Dense(
-            units=self.M_channels, 
-            activation="linear", 
-            name="noise_projection"
-        )
-
-    def call(self, inputs):
-        # inputs - это латентный вектор (batch_size, N_dim)
-        
-        # Генерируем параметры текущей эпохи
-        z = self.z_dense(inputs)               # (batch_size, N_patterns)
-        noise_log = self.noise_dense(inputs)   # (batch_size, M_channels)
-        
-        A_norm = tf.math.l2_normalize(self.A, axis=0)
-        P = tf.exp(z)
-        
-        # Реконструкция полезного сигнала: A * P * A^T
-        C_signal = tf.einsum("mf,bf,lf->bml", A_norm, P, A_norm)
-        
-        # Динамический вектор шума
-        noise_variance = tf.math.softplus(noise_log)
-        noise_diag = tf.linalg.diag(noise_variance)
-        
-        # Итоговая ковариация
-        C_recon = C_signal + noise_diag
-        return C_recon
-
-# =============================================================================
-# СБОРКА МОДЕЛЕЙ
-# =============================================================================
-encoder = tf.keras.Sequential([
-    tf.keras.layers.InputLayer(shape=(input_dim,)),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(N_dim, activation="linear", name="umap_embedding")
-])
-
-# Декодер теперь максимально простой снаружи, вся магия внутри нашего слоя
-spatial_decoder = SpatialPatternDecoder(M_channels=n_ch_white, N_patterns=N_patterns, name="spatial_decoder")
-
-decoder = tf.keras.Sequential([
-    tf.keras.layers.InputLayer(shape=(N_dim,)),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(100, activation="relu"),
-    spatial_decoder,
-    tf.keras.layers.Flatten()
-])
-
-# =============================================================================
-# ОБУЧЕНИЕ ParametricUMAP
-# =============================================================================
-print(f"Обучение с N_dim={N_dim}, N_patterns={N_patterns}")
-embedder = ParametricUMAP(
-    encoder=encoder,
-    decoder=decoder,
-    n_components=N_dim,
-    dims=(input_dim,),
-    metric="precomputed",
-    parametric_reconstruction=True,
-    autoencoder_loss=True,
-    parametric_reconstruction_loss_fcn=riemannian_distance_loss,
-    verbose=True
-)
-
-embedder.fit(X_cov_flat, precomputed_distances=dist_matrix_init)
-umap_coords = embedder.embedding_
-
-# %%
-# =============================================================================
-# 6. ИЗВЛЕЧЕНИЕ ПАРАМЕТРОВ И ОТРИСОВКА
-# =============================================================================
-import matplotlib.pyplot as plt
-import matplotlib as mpl
-import numpy as np
-import tensorflow as tf
-
-latent = embedder.encoder.predict(X_cov_flat)   # (n_windows, N_dim)
-
-# 1. Извлекаем признаки перед spatial_decoder
-decoder_input = tf.keras.Input(shape=(N_dim,))
-x = decoder_input
-for layer in embedder.decoder.layers:
-    if layer.name == "spatial_decoder":
-        break
-    x = layer(x)
-
-# Создаем усеченную модель, которая выдает скрытые признаки
-hidden_features_model = tf.keras.Model(inputs=decoder_input, outputs=x)
-hidden_features = hidden_features_model.predict(latent)  # (n_windows, 100)
-
-# 2. Вытаскиваем сам слой spatial_decoder
-spatial_decoder_layer = embedder.decoder.get_layer("spatial_decoder")
-
-# Прогоняем скрытые признаки через внутренние проекции слоя вручную
-z_tensor = spatial_decoder_layer.z_dense(hidden_features)
-noise_log_tensor = spatial_decoder_layer.noise_dense(hidden_features)
-
-# 3. Переводим в numpy и в реальные физические величины
-z_values = z_tensor.numpy()
-noise_log_values = noise_log_tensor.numpy()
-
-powers = np.exp(z_values)
-dynamic_noise_variances = tf.math.softplus(noise_log_values).numpy()
-
-# Проверка размерностей
-print(f"Форма мощностей (z_values): {powers.shape} (ожидаем [n_windows, {N_patterns}])")
-print(f"Форма шума (dynamic_noise_variances): {dynamic_noise_variances.shape} (ожидаем [n_windows, {n_ch_white}])")
-
-# 4. Извлекаем матрицу паттернов и нормируем 
-A_learned_raw = spatial_decoder_layer.A.numpy()
-A_global = A_learned_raw / np.linalg.norm(A_learned_raw, axis=0) 
-
-found_patterns = [A_global[:, i] for i in range(N_patterns)]
-
-# 5. Фильтры Хауфе
-C_global_mean = np.mean(covmats, axis=0)
-C_global_inv = np.linalg.pinv(C_global_mean)
-found_filters = [C_global_inv @ A_global[:, i] for i in range(N_patterns)]
-
-print("Модели обучены, сырые паттерны, мощности и динамический шум извлечены.")
-
-# =============================================================================
-# ВИЗУАЛИЗАЦИЯ ДИНАМИКИ ШУМА
-# =============================================================================
-fig, ax = plt.subplots(figsize=(14, 6))
-
-im = ax.imshow(dynamic_noise_variances.T, aspect='auto', cmap='magma', origin='lower')
-cbar = plt.colorbar(im, ax=ax)
-cbar.set_label('Дисперсия шума', rotation=270, labelpad=15)
-
-ax.set_title('Динамика аппаратного (диагонального) шума по сенсорам', fontsize=14)
-ax.set_xlabel('Номер окна (время)')
-ax.set_ylabel('Индекс сенсора (канал ЭЭГ)')
-
-plt.tight_layout()
-plt.show()
+print(f"Модели обучены end-to-end. Размерность powers: {powers.shape}")
 
 # %%
 from matplotlib.gridspec import GridSpec
@@ -544,7 +365,7 @@ def format_umap_axes(ax):
     ax.grid(True, linestyle='--', alpha=0.5, zorder=0)
 
 # Выбираем индекс паттерна (0..N_patterns-1)
-comp_idx = 7
+comp_idx = 2 
 W_sensor = found_filters[comp_idx]
 A_pattern = found_patterns[comp_idx]
 
