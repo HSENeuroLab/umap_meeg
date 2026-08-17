@@ -41,7 +41,7 @@ freq_bands = {
     'Mu': [9, 14],
     'Beta': [15, 25]
 }
-selected_band_name = 'Beta'
+selected_band_name = 'Mu'
 l_freq, h_freq = freq_bands[selected_band_name]
 
 # Параметры скользящего окна
@@ -280,7 +280,7 @@ def riemannian_distance_loss(y_true_flat, y_pred_flat):
 # =============================================================================
 # ПОДГОТОВКА ДАННЫХ
 # =============================================================================
-N_patterns = 20  # Количество источников
+N_patterns = 19  # Количество источников
 N_dim = N_patterns  
 
 # =============================================================================
@@ -336,6 +336,167 @@ reducer_2d = umap.UMAP(n_components=2, metric='euclidean', random_state=42)
 umap_coords = reducer_2d.fit_transform(embedder.embedding_)
 
 # %%
+import tensorflow as tf
+from umap.parametric_umap import ParametricUMAP
+import numpy as np
+
+n_ch_white = covmats.shape[1]
+M = n_ch_white
+
+# =============================================================================
+# 1. ПОДГОТОВКА ДАННЫХ (ТОЛЬКО ВЕРХНИЙ ТРЕУГОЛЬНИК)
+# =============================================================================
+triu_row, triu_col = np.triu_indices(M)
+
+# Вытягиваем только уникальные значения верхнего треугольника
+X_cov_triu = covmats[:, triu_row, triu_col].astype(np.float32)
+input_dim = X_cov_triu.shape[1] # M * (M + 1) / 2
+
+print(f"Размерность входа уменьшена с {M*M} до {input_dim}")
+
+# Индексы для быстрой сборки симметричной матрицы внутри Loss
+idx_sym = np.zeros((M, M), dtype=int)
+idx_sym[triu_row, triu_col] = np.arange(input_dim)
+idx_sym = np.maximum(idx_sym, idx_sym.T)
+idx_sym_flat = idx_sym.flatten()
+
+# Индексы для вытаскивания triu из плоской матрицы в декодере
+flat_triu_indices = np.ravel_multi_index((triu_row, triu_col), (M, M))
+
+# =============================================================================
+# 2. ДЕКОДЕР С ГЛОБАЛЬНЫМ ШУМОМ И ВЫХОДОМ В TRIU
+# =============================================================================
+class SpatialPatternDecoder(tf.keras.layers.Layer):
+    def __init__(self, M_channels, N_patterns, flat_triu_indices, **kwargs):
+        super().__init__(**kwargs)
+        self.M_channels = M_channels
+        self.N_patterns = N_patterns
+        self.flat_triu_indices = flat_triu_indices
+
+    def build(self, input_shape):
+        # 1. Обучаемые паттерны (матрица A)
+        self.A = self.add_weight(
+            shape=(self.M_channels, self.N_patterns),
+            initializer=tf.keras.initializers.RandomNormal(stddev=0.1),
+            trainable=True,
+            name="A_patterns"
+        )
+        
+        # 2. ОБУЧАЕМЫЙ ГЛОБАЛЬНЫЙ ШУМ (общий статический для всех окон)
+        self.noise_log = self.add_weight(
+            shape=(self.M_channels,),
+            initializer=tf.keras.initializers.Constant(-3.0),
+            trainable=True,
+            name="sensor_noise"
+        )
+
+    def call(self, z):
+        # Нормализуем столбцы A
+        A_norm = tf.math.l2_normalize(self.A, axis=0)
+        
+        P = tf.exp(z)
+        
+        # Реконструкция полезного сигнала: A * P * A^T
+        C_signal = tf.einsum("mf,bf,lf->bml", A_norm, P, A_norm)
+        
+        # Положительная дисперсия глобального шума
+        noise_variance = tf.math.softplus(self.noise_log)
+        noise_diag = tf.linalg.diag(noise_variance)
+        
+        # Итоговая ковариация
+        C_recon = C_signal + noise_diag
+        
+        # ВАЖНО: Схлопываем обратно в triu-вектор, чтобы размерность совпадала со входом
+        flat_C = tf.reshape(C_recon, [-1, self.M_channels * self.M_channels])
+        C_recon_triu = tf.gather(flat_C, self.flat_triu_indices, axis=1)
+        
+        return C_recon_triu
+
+# =============================================================================
+# 3. РИМАНОВА ФУНКЦИЯ ПОТЕРЬ (РАБОТАЕТ С TRIU)
+# =============================================================================
+def riemannian_distance_loss(y_true_triu, y_pred_triu):
+    y_true_triu = tf.cast(y_true_triu, tf.float32)
+    y_pred_triu = tf.cast(y_pred_triu, tf.float32)
+
+    # Восстанавливаем полные матрицы M x M из triu векторов
+    C_true_flat = tf.gather(y_true_triu, idx_sym_flat, axis=1)
+    C_pred_flat = tf.gather(y_pred_triu, idx_sym_flat, axis=1)
+    
+    C_true = tf.reshape(C_true_flat, [-1, M, M])
+    C_pred = tf.reshape(C_pred_flat, [-1, M, M])
+    
+    smoothing_factor = 1e-2  
+    eye_M = tf.eye(M, dtype=tf.float32)
+    
+    C_true_reg = C_true + smoothing_factor * eye_M
+    C_pred_reg = C_pred + smoothing_factor * eye_M
+
+    eps = 1e-7
+
+    eigvals_true, eigvecs_true = tf.linalg.eigh(C_true_reg)
+    inv_sqrt_eigvals = 1.0 / tf.sqrt(tf.maximum(eigvals_true, eps))
+    C_true_invsqrt = tf.einsum('bij,bj,bkj->bik', eigvecs_true, inv_sqrt_eigvals, eigvecs_true)
+
+    C_mid = tf.einsum('bij,bjk,bkl->bil', C_true_invsqrt, C_pred_reg, C_true_invsqrt)
+    C_mid = 0.5 * (C_mid + tf.transpose(C_mid, [0, 2, 1]))  
+
+    eigvals_mid, eigvecs_mid = tf.linalg.eigh(C_mid)
+    log_eigvals_mid = tf.math.log(tf.maximum(eigvals_mid, eps))
+    logC_mid = tf.einsum('bij,bj,bkj->bik', eigvecs_mid, log_eigvals_mid, eigvecs_mid)
+
+    dist_sq = tf.reduce_sum(tf.square(logC_mid), axis=(1, 2))
+    return tf.reduce_mean(dist_sq)
+
+# =============================================================================
+# 4. СБОРКА МОДЕЛИ
+# =============================================================================
+N_patterns = 19  # Количество источников
+N_dim = N_patterns  
+
+encoder = tf.keras.Sequential([
+    tf.keras.layers.InputLayer(shape=(input_dim,)),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(100, activation="relu"),
+    tf.keras.layers.Dense(N_dim, activation="linear", name="z_powers")
+])
+
+decoder = tf.keras.Sequential([
+    tf.keras.layers.InputLayer(shape=(N_dim,)),
+    SpatialPatternDecoder(
+        M_channels=M, 
+        N_patterns=N_patterns, 
+        flat_triu_indices=flat_triu_indices, 
+        name="spatial_decoder"
+    )
+])
+
+print(f"Обучение ParametricUMAP: N_dim={N_dim}, N_patterns={N_patterns}")
+
+embedder = ParametricUMAP(
+    encoder=encoder,
+    decoder=decoder,
+    n_components=N_dim, 
+    dims=(input_dim,),
+    metric="precomputed",
+    parametric_reconstruction=True,
+    autoencoder_loss=True,
+    parametric_reconstruction_loss_fcn=riemannian_distance_loss,
+    verbose=True
+)
+
+# Обучаем модель на triu-признаках!
+embedder.fit(X_cov_triu, precomputed_distances=dist_matrix_init)
+
+# =============================================================================
+# 5. 2D КЛИКЕР И ПРОЕКЦИЯ
+# =============================================================================
+print("Проекция мощностей в 2D для интерфейса...")
+reducer_2d = umap.UMAP(n_components=2, metric='euclidean', random_state=42)
+umap_coords = reducer_2d.fit_transform(embedder.embedding_)
+
+# %%
 # =============================================================================
 # 6. ИЗВЛЕЧЕНИЕ ПАРАМЕТРОВ И ОТРИСОВКА
 # =============================================================================
@@ -343,7 +504,7 @@ import matplotlib as mpl
 
 # 1. Извлекаем сырые значения z (логарифмы мощностей) 
 # Теперь выход энкодера — это и есть наше пространство источников!
-z_values = embedder.encoder.predict(X_cov_flat)   # Размерность: (n_windows, N_patterns)
+z_values = embedder.encoder.predict(X_cov_triu)   # Размерность: (n_windows, N_patterns)
 
 # 2. Переводим в реальные мощности
 powers = np.exp(z_values)

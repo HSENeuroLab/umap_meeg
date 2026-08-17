@@ -30,7 +30,7 @@ from pyriemann.geometry.distance import pairwise_distance
 # =============================================================================
 # 1. ЗАГРУЗКА И ПРЕДОБРАБОТКА ДАННЫХ
 # =============================================================================
-fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part1/eeg/10_07_g1_2223_raw.fif"
+fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part2/eeg/TumAle_raw.fif"
 raw = mne.io.read_raw_fif(fpath, preload=True)
 sfreq = raw.info['sfreq']
 
@@ -38,6 +38,7 @@ new_descriptions = [
     'RS_EC_1', 'RS_EO_1', '2Hz', '05Hz', '4Hz', '1Hz', '3Hz',
     'NoRy_1', 'Waltz_1', 'Waltz_2', 'NoRy_2', 'NoRy_3', 'Waltz_3',
     'NoRy_4', 'Waltz_4', 'NoRy_5', 'Waltz_5', 'RS_EC_2', 'RS_EO_2',
+    'Waltz_6', 'Waltz_7', 'Waltz_8'
 ]
 
 descriptions = raw.annotations.description
@@ -49,9 +50,12 @@ for idx, label in zip(significant_indices, new_descriptions):
     new_desc[idx] = label
 
 old_annot = raw.annotations
+new_durations = np.array(old_annot.duration, copy=True)
+new_durations[significant_indices] = 120
+
 new_annot = mne.Annotations(
     onset=old_annot.onset,
-    duration=old_annot.duration,
+    duration=new_durations,
     description=np.array(new_desc, dtype='U20'),
     orig_time=old_annot.orig_time
 )
@@ -59,6 +63,9 @@ raw.set_annotations(new_annot)
 
 raw_clean = raw.copy().pick_types(eeg=True)
 data = raw.get_data()
+
+# %%
+raw.plot()
 
 # %%
 # =============================================================================
@@ -70,6 +77,9 @@ noise_pieces = []
 b_signal, a_signal = butter(3, np.array([15, 25]) / (int(sfreq) / 2), btype='band')
 b_broad, a_broad = butter(3, np.array([13, 30]) / (int(sfreq) / 2), btype='band')
 b_stop, a_stop = butter(3, np.array([14.5, 25.5]) / (int(sfreq) / 2), btype='stop')
+# b_signal, a_signal = butter(3, np.array([8, 12]) / (int(sfreq) / 2), btype='band')
+# b_broad, a_broad = butter(3, np.array([6, 14]) / (int(sfreq) / 2), btype='band')
+# b_stop, a_stop = butter(3, np.array([7.5, 12.5]) / (int(sfreq) / 2), btype='stop')
 
 crop_duration = 0.5
 crop_samples = int(crop_duration * sfreq)
@@ -129,7 +139,7 @@ overlap = Wsize - Ssize
 
 X_windows_band = []
 X_windows_unfilt = []
-labels = []
+window_labels = []
 
 raw_band = raw.copy().filter(l_freq=15, h_freq=25).pick_types(eeg=True)
 raw_unfilt = raw.copy().pick_types(eeg=True)
@@ -151,11 +161,11 @@ for annot in raw.annotations:
     if epochs_band and len(epochs_band) == len(epochs_unfilt):
         X_windows_band.append(epochs_band.get_data(copy=False))
         X_windows_unfilt.append(epochs_unfilt.get_data(copy=False))
-        labels.extend([desc] * len(epochs_band))
+        window_labels.extend([desc] * len(epochs_band))
 
 X_windows_band = np.concatenate(X_windows_band, axis=0)
 X_windows_unfilt = np.concatenate(X_windows_unfilt, axis=0)
-labels = np.array(labels)
+window_labels = np.array(window_labels)
 
 n_windows, n_ch, n_times = X_windows_band.shape
 X_windows_ssd_proj = np.zeros((n_windows, n_components_ssd, n_times))
@@ -172,6 +182,20 @@ C_avg_sqrt = np.linalg.inv(C_avg_invsqrt)
 covmats_white = C_avg_invsqrt @ covmats_ssd @ C_avg_invsqrt
 
 dist_matrix_init = pairwise_distance(covmats_white, metric='riemann')
+
+# %%
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 1. Находим пороговое значение для 95-го процентиля
+threshold = np.percentile(dist_matrix_init, 95)
+
+# 2. Отображаем всю матрицу целиком, ограничив верхний диапазон цвета
+plt.imshow(dist_matrix_init, vmax=threshold)
+
+# 3. Добавляем цветовую шкалу
+plt.colorbar(label="Расстояние (максимум ограничен 95-м процентилем)")
+plt.show()
 
 # %%
 from pyriemann.tangentspace import TangentSpace
@@ -268,6 +292,41 @@ def riemannian_distance_loss(y_true_flat, y_pred_flat):
     dist_sq = tf.reduce_sum(tf.square(logC_mid), axis=(1, 2))
     return tf.reduce_mean(dist_sq)
 
+def log_euclidean_loss(y_true_flat, y_pred_flat):
+    y_true_flat = tf.cast(y_true_flat, tf.float32)
+    y_pred_flat = tf.cast(y_pred_flat, tf.float32)
+
+    M = n_ch_white  
+    C_true = tf.reshape(y_true_flat, [-1, M, M])
+    C_pred = tf.reshape(y_pred_flat, [-1, M, M])
+    
+    # 1. Жесткая симметризация (защита от ошибок float32)
+    C_true = 0.5 * (C_true + tf.transpose(C_true, perm=[0, 2, 1]))
+    C_pred = 0.5 * (C_pred + tf.transpose(C_pred, perm=[0, 2, 1]))
+    
+    # 2. Регуляризация (чтобы собственные значения не были нулями)
+    eps = 1e-4
+    eye_M = tf.eye(M, dtype=tf.float32)
+    C_true_reg = C_true + eps * eye_M
+    C_pred_reg = C_pred + eps * eye_M
+
+    # 3. Вычисляем Матричный Логарифм для ТАРГЕТА (C_true)
+    eigvals_true, eigvecs_true = tf.linalg.eigh(C_true_reg)
+    log_eigvals_true = tf.math.log(tf.maximum(eigvals_true, 1e-9))
+    log_C_true = tf.einsum('bij,bj,bkj->bik', eigvecs_true, log_eigvals_true, eigvecs_true)
+
+    # 4. Вычисляем Матричный Логарифм для ПРЕДСКАЗАНИЯ (C_pred)
+    eigvals_pred, eigvecs_pred = tf.linalg.eigh(C_pred_reg)
+    log_eigvals_pred = tf.math.log(tf.maximum(eigvals_pred, 1e-9))
+    log_C_pred = tf.einsum('bij,bj,bkj->bik', eigvecs_pred, log_eigvals_pred, eigvecs_pred)
+
+    # 5. Считаем Фробениусово расстояние между логарифмами (это и есть LEM!)
+    # Разница матриц -> возводим каждый элемент в квадрат -> суммируем
+    diff = log_C_true - log_C_pred
+    dist_sq = tf.reduce_sum(tf.square(diff), axis=(1, 2))
+    
+    return tf.reduce_mean(dist_sq)
+
 # =============================================================================
 # ПОДГОТОВКА ДАННЫХ
 # =============================================================================
@@ -292,39 +351,144 @@ decoder = tf.keras.Sequential([
     tf.keras.layers.Flatten()
 ])
 
+# %%
 # =============================================================================
-# ОБУЧЕНИЕ PARAMETRIC UMAP
+# НАСТРОЙКА ПАРАМЕТРОВ ОБУЧЕНИЯ (RECOMENDATIONS)
 # =============================================================================
+
+# 1. Параметры Keras (Нейросети)
+batch_size = 64
+keras_epochs = 5  # Сколько раз нейросеть пройдет по всему сгенерированному графу
+loss_weight = 1.0 # Баланс. Если Риманово расстояние падает плохо, увеличьте до 5.0 - 10.0
+
+# 2. Параметры UMAP (Топологии)
+n_neighbors = 15  # Размер локальной окрестности (10-15 оптимально для ЭЭГ)
+umap_n_epochs = 200 # Количество итераций оптимизации графа (для датасетов <10000 точек можно 500)
+
 print(f"Обучение ParametricUMAP: N_dim={N_dim}, N_patterns={N_patterns}")
 
+# =============================================================================
+# КОЛЛБЕКИ KERAS (ДЛЯ ПОЛНОГО КОНТРОЛЯ)
+# =============================================================================
+# ParametricUMAP позволяет передавать любые аргументы напрямую в Keras Model.fit()
+early_stopping = tf.keras.callbacks.EarlyStopping(
+    monitor='loss', 
+    patience=3, 
+    restore_best_weights=True,
+    verbose=1
+)
+
+keras_fit_args = {
+    "callbacks": [early_stopping],
+    # "validation_split": 0.1 # Можно добавить, если используете валидационную выборку
+}
+
+# =============================================================================
+# ИНИЦИАЛИЗАЦИЯ PARAMETRIC UMAP
+# =============================================================================
 embedder = ParametricUMAP(
     encoder=encoder,
     decoder=decoder,
     n_components=N_dim, 
     dims=(input_dim,),
-    metric="precomputed",
+    metric="precomputed", # Обязательно, так как мы передаем матрицу dist_matrix_init
+    n_neighbors=n_neighbors,
+    n_epochs=umap_n_epochs, # Параметр алгоритма UMAP
+    batch_size=batch_size,
     parametric_reconstruction=True,
-    autoencoder_loss=True,
+    autoencoder_loss=True, # Градиенты от декодера текут в энкодер
     parametric_reconstruction_loss_fcn=riemannian_distance_loss,
+    parametric_reconstruction_loss_weight=loss_weight,
+    keras_fit_kwargs=keras_fit_args, # Проброс аргументов в Keras
     verbose=True
 )
 
-# Обучаем: сеть балансирует между сохранением Риманова графа (UMAP) и реконструкцией матриц (Декодер)
-embedder.fit(X_cov_flat, precomputed_distances=dist_matrix_init,
-             # epochs=5,
-             # steps_per_epoch=steps_per_epoch
-             )
+# =============================================================================
+# ТОНКАЯ НАСТРОЙКА ВНУТРЕННИХ ПАРАМЕТРОВ КЛАССА
+# =============================================================================
+# По умолчанию ParametricUMAP делит 1 эпоху на 10 частей (loss_report_frequency = 10) 
+# для более частого вывода логов. 
+# Мы устанавливаем это значение в 1, чтобы 1 Keras-эпоха строго равнялась 1 проходу по графу.
+embedder.loss_report_frequency = 1 
+
+# Устанавливаем количество реальных проходов нейросети по датасету[cite: 4]
+embedder.n_training_epochs = keras_epochs 
 
 # =============================================================================
-# КАК СДЕЛАТЬ 2D КЛИКЕР ТЕПЕРЬ?
+# ЗАПУСК ОБУЧЕНИЯ
 # =============================================================================
-# embedder.embedding_ сейчас имеет размерность (n_windows, 5)
-# Чтобы сделать красивый 2D-дашборд для кликера, мы просто проецируем эти готовые, 
-# физиологически осмысленные 5D точки на плоскость с помощью обычного UMAP:
+# Библиотека сама:
+# 1. Построит нечеткие симплициальные множества на основе dist_matrix_init[cite: 4]
+# 2. Сгенерирует tf.data.Dataset из пар точек (to_x, from_x)[cite: 4]
+# 3. Вызовет Keras .fit()[cite: 4]
+embedder.fit(X_cov_flat, precomputed_distances=dist_matrix_init)
 
-# print("Проекция мощностей в 2D для интерфейса...")
-reducer_2d = umap.UMAP(n_components=2, metric='euclidean', random_state=42)
-umap_coords = reducer_2d.fit_transform(embedder.embedding_)
+# =============================================================================
+# ВИЗУАЛИЗАЦИЯ И ИЗВЛЕЧЕНИЕ ПАТТЕРНОВ
+# =============================================================================
+import matplotlib.pyplot as plt
+
+# Вытягиваем историю напрямую из скрытого атрибута объекта
+history = embedder._history
+
+plt.figure(figsize=(10, 5))
+plt.plot(history['loss'], label='Total Loss (UMAP CE + Riemannian)', color='purple', linewidth=2)
+plt.title('График обучения Parametric UMAP')
+plt.xlabel('Эпохи (Keras)')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.show()
+
+# %%
+# =============================================================================
+# ОБУЧЕНИЕ ОТОБРАЖЕНИЯ ДЛЯ КЛИКЕРА (20D Мощности <-> 2D Экран)
+# =============================================================================
+print("Обучение инверсной модели визуализации (20D -> 2D -> 20D)...")
+from tensorflow.keras import regularizers
+
+# Энкодер: сжимает 20D мощности в 2D для отрисовки на экране
+encoder_2d = tf.keras.Sequential([
+    tf.keras.layers.InputLayer(shape=(N_dim,)),
+    tf.keras.layers.Dense(100, activation="elu"),
+    tf.keras.layers.Dense(100, activation="elu"),
+    tf.keras.layers.Dense(100, activation="elu"),
+    tf.keras.layers.Dense(2, activation="linear", name="2d_coords")
+])
+
+# Декодер: с мягкой L2-регуляризацией для страховки от выбросов
+decoder_2d = tf.keras.Sequential([
+    tf.keras.layers.InputLayer(shape=(2,)),
+    tf.keras.layers.Dense(100, activation="elu", kernel_regularizer=regularizers.l2(1e-4)),
+    tf.keras.layers.Dense(100, activation="elu", kernel_regularizer=regularizers.l2(1e-4)),
+    tf.keras.layers.Dense(100, activation="elu", kernel_regularizer=regularizers.l2(1e-4)),
+    tf.keras.layers.Dense(N_dim, activation="linear", name="z_reconstruction")
+])
+
+reducer_2d_nn = ParametricUMAP(
+    encoder=encoder_2d,
+    decoder=decoder_2d,
+    n_components=2,
+    parametric_reconstruction=True, 
+    parametric_reconstruction_loss_fcn=tf.keras.losses.MeanSquaredError(),
+    # =========================
+    verbose=True
+)
+
+# Обучаем визуальное пространство
+pred = encoder.predict(X_cov_flat)
+umap_coords = reducer_2d_nn.fit_transform(pred)
+print("Визуальное пространство обучено!")
+
+# %%
+# 2. Визуализация
+plt.figure(figsize=(8, 6))
+plt.scatter(umap_coords[:, 0], umap_coords[:, 1], alpha=0.6, edgecolors='w', s=30)
+plt.title('Визуализация данных через PCA (2D)')
+plt.xlabel('Главная компонента 1')
+plt.ylabel('Главная компонента 2')
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.show()
 
 # %%
 # =============================================================================
@@ -356,6 +520,47 @@ found_filters = [C_global_inv @ A_global[:, i] for i in range(N_patterns)]
 print(f"Модели обучены end-to-end. Размерность powers: {powers.shape}")
 
 # %%
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 1. Расчет матрицы корреляций (20 x 20)
+# rowvar=False указывает, что переменные (компоненты) находятся в столбцах
+corr_matrix = np.corrcoef(powers, rowvar=False)
+
+# 2. Настройка графика
+fig, ax = plt.subplots(figsize=(12, 10))
+
+# Отображаем матрицу в виде тепловой карты
+# cmap='coolwarm' центрирует цвета (синий = -1, белый = 0, красный = 1)
+im = ax.imshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
+
+# Добавляем цветовую шкалу справа
+cbar = ax.figure.colorbar(im, ax=ax, shrink=0.8)
+cbar.ax.set_ylabel("Коэффициент корреляции", rotation=-90, va="bottom")
+
+# 3. Настройка осей (индексы от 1 до 20)
+num_components = corr_matrix.shape[1]
+ticks = np.arange(num_components)
+labels = [f"C{i+1}" for i in ticks]
+
+ax.set_xticks(ticks)
+ax.set_yticks(ticks)
+ax.set_xticklabels(labels, rotation=45, ha="right")
+ax.set_yticklabels(labels)
+
+# 4. Отображение числовых значений внутри ячеек (по желанию)
+# Из-за плотности 20x20 используем мелкий шрифт
+for i in range(num_components):
+    for j in range(num_components):
+        text = ax.text(j, i, f"{corr_matrix[i, j]:.2f}",
+                       ha="center", va="center", color="black", fontsize=8)
+
+# Финальное оформление
+ax.set_title("Матрица корреляций компонент (NumPy & Matplotlib)", fontsize=14, pad=20)
+fig.tight_layout()
+plt.show()
+
+# %%
 from matplotlib.gridspec import GridSpec
 
 def format_umap_axes(ax):
@@ -364,8 +569,9 @@ def format_umap_axes(ax):
     ax.tick_params(axis='both', which='both', length=0)
     ax.grid(True, linestyle='--', alpha=0.5, zorder=0)
 
+print("Toha, the best coder in the world")  # AI slope  
 # Выбираем индекс паттерна (0..N_patterns-1)
-comp_idx = 2 
+comp_idx = 0
 W_sensor = found_filters[comp_idx]
 A_pattern = found_patterns[comp_idx]
 
@@ -398,12 +604,31 @@ ax_patt = fig.add_subplot(gs[1, 0])
 mne.viz.plot_topomap(A_pattern, raw.info, axes=ax_patt, show=False)
 ax_patt.set_title('Истинный паттерн источника (A)')
 
-# Отрисовка UMAP (используем выученную нормализованную мощность для цвета)
+# =============================================================================
 ax_umap = fig.add_subplot(gs[0, 1])
-sc1 = ax_umap.scatter(umap_coords[:, 0], umap_coords[:, 1], c=p_vals_norm, cmap='plasma', s=15, zorder=2)
-plt.colorbar(sc1, ax=ax_umap, label='Мощность источника (scaled)')
+
+# Вычисляем робастные границы (5-й и 95-й перцентили)
+# Все значения ниже 5% будут окрашены в цвет минимума, а выше 95% - в цвет максимума
+vmin_val = np.percentile(p_vals_norm, 5)
+vmax_val = np.percentile(p_vals_norm, 95)
+
+sc1 = ax_umap.scatter(
+    umap_coords[:, 0], 
+    umap_coords[:, 1], 
+    c=p_vals_norm, 
+    cmap='plasma', 
+    s=15, 
+    zorder=2,
+    vmin=vmin_val,
+    vmax=vmax_val   
+)
+
+# Аргумент extend='both' добавит красивые треугольники на концах colorbar, 
+# показывая зрителю, что есть значения, выходящие за пределы шкалы
+plt.colorbar(sc1, ax=ax_umap, label='Мощность источника (scaled)', extend='both')
 ax_umap.set_title(f'UMAP проекция\nЦвет: мощность компоненты {comp_idx+1}')
 format_umap_axes(ax_umap)
+# =============================================================================
 
 ax_env = fig.add_subplot(gs[1, 1])
 window_idx = np.arange(len(p_vals_norm))
@@ -441,156 +666,427 @@ plt.show()
 
 # %%
 # =============================================================================
-# 7. СУПЕР-ИНТЕРАКТИВНЫЙ ДАШБОРД: АКТИВАЦИЯ ИСТОЧНИКОВ В UMAP
+# 7. СУПЕР-ИНТЕРАКТИВНЫЙ ДАШБОРД:
+#    АКТИВАЦИЯ ИСТОЧНИКОВ В 2D-ПРОСТРАНСТВЕ
 # =============================================================================
+
 import matplotlib.patheffects as pe
 from matplotlib.gridspec import GridSpec
+import numpy as np
+import matplotlib.pyplot as plt
 
 print("Подготовка интерактивного дашборда...")
 
-# 1. Отбираем самые "дисперсные" источники
+# =============================================================================
+# 1. ПРОВЕРКА ДАННЫХ
+# =============================================================================
+
+original_labels = window_labels.copy()
+
+print("powers:", powers.shape)
+print("umap_coords:", umap_coords.shape)
+print("window_labels:", window_labels.shape)
+
+assert len(window_labels) == len(powers), (
+    f"Количество labels ({len(window_labels)}) "
+    f"не совпадает с количеством окон ({len(powers)})"
+)
+
+assert len(umap_coords) == len(powers), (
+    f"Количество UMAP-точек ({len(umap_coords)}) "
+    f"не совпадает с количеством окон ({len(powers)})"
+)
+
+# =============================================================================
+# 2. ВЫБИРАЕМ НАИБОЛЕЕ ДИСПЕРСНЫЕ ИСТОЧНИКИ
+# =============================================================================
+
 power_variances = np.var(powers, axis=0)
+
 top_n = min(15, N_patterns)
+
 top_indices = np.argsort(power_variances)[::-1][:top_n]
 
-print(f"Отображаем топ-{top_n} источников с наибольшей дисперсией: {top_indices}")
+print(
+    f"Отображаем топ-{top_n} источников "
+    f"с наибольшей дисперсией:"
+)
+print(top_indices + 1)
 
-# 2. Настройка цветов и легенды с сохранением ИСХОДНОГО порядка!
-# Используем ваш список new_descriptions из начала скрипта
+
+# =============================================================================
+# 3. ЦВЕТА КЛАССОВ
+# =============================================================================
+
+# Сначала сохраняем порядок, заданный new_descriptions.
 unique_classes = []
+
 for lab in new_descriptions:
-    if lab in labels and lab not in unique_classes:
+    if lab in original_labels and lab not in unique_classes:
         unique_classes.append(lab)
-        
-# На всякий случай добавляем те, что есть в labels, но вдруг не попали в список
-for lab in labels:
+
+# Добавляем всё, что вдруг отсутствует в new_descriptions.
+for lab in original_labels:
     if lab not in unique_classes:
         unique_classes.append(lab)
 
-class_to_id = {lab: i + 1 for i, lab in enumerate(unique_classes)}
-cmap_classes = plt.cm.tab20
-color_map = {lab: cmap_classes(i / max(1, len(unique_classes) - 1)) for i, lab in enumerate(unique_classes)}
-point_colors = [color_map[lab] for lab in labels]
+class_to_id = {
+    lab: i + 1
+    for i, lab in enumerate(unique_classes)
+}
 
-# 3. Настройка сетки графика
+cmap_classes = plt.cm.tab20
+
+if len(unique_classes) == 1:
+    color_map = {
+        unique_classes[0]: cmap_classes(0)
+    }
+else:
+    color_map = {
+        lab: cmap_classes(i / (len(unique_classes) - 1))
+        for i, lab in enumerate(unique_classes)
+    }
+
+point_colors = [
+    color_map[lab]
+    for lab in original_labels
+]
+
+
+# =============================================================================
+# 4. FIGURE
+# =============================================================================
+
 N_COLS_TOPO = 3
 N_ROWS_TOPO = int(np.ceil(top_n / N_COLS_TOPO))
 
-fig = plt.figure(figsize=(18, max(8, 2 * N_ROWS_TOPO)))
-gs = GridSpec(N_ROWS_TOPO + 1, N_COLS_TOPO + 2, width_ratios=[3.0, 0.5] + [1]*N_COLS_TOPO, height_ratios=[0.5] + [2]*N_ROWS_TOPO)
+fig = plt.figure(
+    figsize=(18, max(8, 2.5 * N_ROWS_TOPO))
+)
+
+gs = GridSpec(
+    N_ROWS_TOPO + 1,
+    N_COLS_TOPO + 2,
+    figure=fig,
+    width_ratios=[3.0, 0.5] + [1] * N_COLS_TOPO,
+    height_ratios=[0.5] + [2] * N_ROWS_TOPO
+)
+
 
 # =============================================================================
-# ПОСТРОЕНИЕ UMAP (Левая панель)
+# 5. UMAP
 # =============================================================================
+
 ax_umap = fig.add_subplot(gs[:, 0])
+
 ax_text = fig.add_subplot(gs[0, 2:])
 ax_text.axis('off')
 
-# Рисуем все эпохи
-ax_umap.scatter(umap_coords[:, 0], umap_coords[:, 1], c=point_colors, 
-                s=15, alpha=0.4, edgecolors='white', linewidths=0.2, zorder=1)
 
-# Рисуем центроиды классов
+# Все точки
+ax_umap.scatter(
+    umap_coords[:, 0],
+    umap_coords[:, 1],
+    c=point_colors,
+    s=15,
+    alpha=0.4,
+    edgecolors='white',
+    linewidths=0.2,
+    zorder=1
+)
+
+
+# =============================================================================
+# 6. ЦЕНТРОИДЫ КЛАССОВ
+# =============================================================================
+
 for lab in unique_classes:
-    mask = (labels == lab)
+
+    mask = original_labels == lab
+
     if not np.any(mask):
         continue
-    cx, cy = np.mean(umap_coords[mask], axis=0)
-    ax_umap.scatter(cx, cy, marker='*', s=450, facecolor=color_map[lab], 
-                    edgecolor='black', linewidths=1.0, zorder=3)
-    # Цифра внутри звезды
-    ax_umap.text(cx, cy, str(class_to_id[lab]), fontsize=11, fontweight='bold', color='white', 
-                 ha='center', va='center', zorder=4, 
-                 path_effects=[pe.withStroke(linewidth=2.5, foreground="black")])
 
-ax_umap.set_title("Фазовое пространство UMAP", fontsize=14)
+    cx = np.mean(umap_coords[mask, 0])
+    cy = np.mean(umap_coords[mask, 1])
+
+    ax_umap.scatter(
+        cx,
+        cy,
+        marker='*',
+        s=450,
+        facecolor=color_map[lab],
+        edgecolor='black',
+        linewidths=1.0,
+        zorder=3
+    )
+
+    ax_umap.text(
+        cx,
+        cy,
+        str(class_to_id[lab]),
+        fontsize=11,
+        fontweight='bold',
+        color='white',
+        ha='center',
+        va='center',
+        zorder=4,
+        path_effects=[
+            pe.withStroke(
+                linewidth=2.5,
+                foreground="black"
+            )
+        ]
+    )
+
+
+ax_umap.set_title(
+    "Фазовое пространство UMAP",
+    fontsize=14
+)
+
 ax_umap.set_xlabel("UMAP 1")
 ax_umap.set_ylabel("UMAP 2")
-ax_umap.grid(True, linestyle='--', alpha=0.4, zorder=0)
 
-# Легенда (увеличили ncol=4, уменьшили шрифт)
-handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color_map[lab], markersize=8) for lab in unique_classes]
-legend_labels = [f"{class_to_id[lab]}: {lab}" for lab in unique_classes]
-ax_umap.legend(handles, legend_labels, title="Условия", loc='upper center', 
-               bbox_to_anchor=(0.5, -0.08), ncol=4, fontsize=8, title_fontsize=10)
+ax_umap.grid(
+    True,
+    linestyle='--',
+    alpha=0.4,
+    zorder=0
+)
 
-# Информационный текст сверху
-txt_info = ax_text.text(0.5, 0.5, "Наведите курсор на точки UMAP", 
-                        ha='center', va='center', fontsize=16, color='gray', fontweight='bold')
 
 # =============================================================================
-# ПОСТРОЕНИЕ СТАТИЧНЫХ ТОПОМАПОВ (Правая панель)
+# 7. ЛЕГЕНДА
 # =============================================================================
-print("Генерация топомапов (может занять несколько секунд)...")
+
+handles = [
+    plt.Line2D(
+        [0],
+        [0],
+        marker='o',
+        color='w',
+        markerfacecolor=color_map[lab],
+        markersize=8
+    )
+    for lab in unique_classes
+]
+
+legend_labels = [
+    f"{class_to_id[lab]}: {lab}"
+    for lab in unique_classes
+]
+
+ax_umap.legend(
+    handles,
+    legend_labels,
+    title="Условия",
+    loc='upper center',
+    bbox_to_anchor=(0.5, -0.08),
+    ncol=4,
+    fontsize=8,
+    title_fontsize=10
+)
+
+
+# =============================================================================
+# 8. ИНФОРМАЦИОННАЯ ПАНЕЛЬ
+# =============================================================================
+
+txt_info = ax_text.text(
+    0.5,
+    0.5,
+    "Наведите курсор на точки UMAP",
+    ha='center',
+    va='center',
+    fontsize=16,
+    color='gray',
+    fontweight='bold'
+)
+
+
+# =============================================================================
+# 9. ТОПОМАПЫ ИСТОЧНИКОВ
+# =============================================================================
+
+print(
+    "Генерация топомапов "
+    "(может занять несколько секунд)..."
+)
+
 ax_topos = []
 overlays = []
 titles = []
 
-mne_info = raw.info 
+mne_info = raw.info
 
 for i, comp_idx in enumerate(top_indices):
+
     row = 1 + i // N_COLS_TOPO
     col = 2 + i % N_COLS_TOPO
+
     ax = fig.add_subplot(gs[row, col])
-    
-    mne.viz.plot_topomap(found_patterns[comp_idx], mne_info, axes=ax, show=False, contours=0)
-    
-    overlay = plt.Rectangle((0, 0), 1, 1, transform=ax.transAxes, color='white', alpha=0.90, zorder=10)
+
+    mne.viz.plot_topomap(
+        found_patterns[comp_idx],
+        mne_info,
+        axes=ax,
+        show=False,
+        contours=0
+    )
+
+    # Белый overlay скрывает топомап.
+    # При наведении мы уменьшаем alpha,
+    # и соответствующий паттерн становится видимым.
+    overlay = plt.Rectangle(
+        (0, 0),
+        1,
+        1,
+        transform=ax.transAxes,
+        color='white',
+        alpha=0.90,
+        zorder=10
+    )
+
     ax.add_patch(overlay)
+
     overlays.append(overlay)
-    
-    title = ax.set_title(f"Ист. {comp_idx+1}\nМощн: --", fontsize=11, color='gray')
+
+    title = ax.set_title(
+        f"Ист. {comp_idx + 1}\nМощн: --",
+        fontsize=11,
+        color='gray'
+    )
+
     titles.append(title)
-    
+
     ax.axis('off')
+
     ax_topos.append(ax)
+
+
+# =============================================================================
+# 10. МАРКЕР ТЕКУЩЕЙ ПОЗИЦИИ
+# =============================================================================
 
 highlighted_point = None
 
+
 # =============================================================================
-# ЛОГИКА ИНТЕРАКТИВНОСТИ
+# 11. ФУНКЦИЯ ОБНОВЛЕНИЯ DASHBOARD
 # =============================================================================
+
 def update_dashboard(event):
+
     global highlighted_point
-    
+
+    # Реагируем только на события внутри UMAP
     if event.inaxes != ax_umap:
         return
-    if event.name == 'motion_notify_event' and event.button is None:
-        return
-        
-    x, y = event.xdata, event.ydata
+
+    # Только движение мыши / клик
+    if event.name == 'motion_notify_event':
+        if event.button is not None:
+            return
+
+    x = event.xdata
+    y = event.ydata
+
     if x is None or y is None:
         return
 
+
+    # -------------------------------------------------------------------------
+    # 11.1. ДЕКОДИРУЕМ 2D -> 20D
+    # -------------------------------------------------------------------------
+
     z_click = np.array([[x, y]], dtype=np.float32)
-    hidden_feats_click = hidden_features_model.predict(z_click, verbose=0)
-    z_values_click = spatial_decoder_layer.z_dense(hidden_feats_click).numpy()
     
-    p_vals = np.exp(z_values_click)[0] 
+    z_20d = decoder_2d.predict(
+        z_click,
+        verbose=0
+    )[0]
+    
+    p_vals = z_20d
+
+    print(
+        "z_20d:",
+        "min =", np.min(z_20d),
+        "max =", np.max(z_20d),
+        "mean =", np.mean(z_20d),
+        "std =", np.std(z_20d),
+        "finite =", np.all(np.isfinite(z_20d))
+    )
+
     p_top = p_vals[top_indices]
-    
-    dists = np.hypot(umap_coords[:, 0] - x, umap_coords[:, 1] - y)
+
+
+    # -------------------------------------------------------------------------
+    # 11.2. ИЩЕМ БЛИЖАЙШУЮ РЕАЛЬНУЮ ТОЧКУ
+    # -------------------------------------------------------------------------
+
+    dists = np.hypot(
+        umap_coords[:, 0] - x,
+        umap_coords[:, 1] - y
+    )
+
     min_dist_idx = np.argmin(dists)
-    
-    label = labels[min_dist_idx]
-    txt_info.set_text(f"Зона: {class_to_id[label]} ({label}) | Координаты: ({x:.1f}, {y:.1f})")
-    txt_info.set_color(color_map[label])
+
+    nearest_label = original_labels[min_dist_idx]
+
+
+    # -------------------------------------------------------------------------
+    # 11.3. ОБНОВЛЯЕМ ТЕКСТ
+    # -------------------------------------------------------------------------
+
+    txt_info.set_text(
+        f"Зона: {class_to_id[nearest_label]} "
+        f"({nearest_label})\n"
+        f"Координаты: ({x:.2f}, {y:.2f})"
+    )
+
+    txt_info.set_color(
+        color_map[nearest_label]
+    )
+
+
+    # -------------------------------------------------------------------------
+    # 11.4. НОРМИРОВКА МОЩНОСТЕЙ
+    # -------------------------------------------------------------------------
 
     p_local_max = np.max(p_top)
     p_local_min = np.min(p_top)
+
     denominator = p_local_max - p_local_min
+
     if denominator < 1e-6:
         denominator = 1e-6
 
+
+    # -------------------------------------------------------------------------
+    # 11.5. ОБНОВЛЯЕМ ТОПОМАПЫ
+    # -------------------------------------------------------------------------
+
     for i, comp_idx in enumerate(top_indices):
+
         power = p_top[i]
-        norm_p = np.clip((power - p_local_min) / denominator, 0, 1)
-        
-        new_alpha = 0.95 * (1 - norm_p)
+
+        norm_p = np.clip(
+            (power - p_local_min) / denominator,
+            0,
+            1
+        )
+
+        # Большая мощность -> прозрачность overlay меньше
+        new_alpha = 0.95 * (1.0 - norm_p)
+
         overlays[i].set_alpha(new_alpha)
-        
-        titles[i].set_text(f"Ист. {comp_idx+1}\nМощн: {power:.2f}")
-        
+
+        titles[i].set_text(
+            f"Ист. {comp_idx + 1}\n"
+            f"Мощн: {power:.2f}"
+        )
+
         if norm_p > 0.4:
             titles[i].set_color('black')
             titles[i].set_fontweight('bold')
@@ -598,18 +1094,62 @@ def update_dashboard(event):
             titles[i].set_color('gray')
             titles[i].set_fontweight('normal')
 
-    if highlighted_point:
+
+    # -------------------------------------------------------------------------
+    # 11.6. МАРКЕР ПОЗИЦИИ
+    # -------------------------------------------------------------------------
+
+    if highlighted_point is not None:
         highlighted_point.remove()
-    highlighted_point = ax_umap.scatter(x, y, marker='+', color='black', s=150, lw=2.0, zorder=5)
-    
+
+    highlighted_point = ax_umap.scatter(
+        x,
+        y,
+        marker='+',
+        color='black',
+        s=150,
+        linewidths=2.0,
+        zorder=5
+    )
+
+
+    # Перерисовываем figure
     fig.canvas.draw_idle()
 
-fig.canvas.mpl_connect('button_press_event', update_dashboard)
-fig.canvas.mpl_connect('motion_notify_event', update_dashboard)
 
-# Увеличили нижний отступ (bottom=0.25), чтобы влезла легенда из 4 колонок
-plt.subplots_adjust(bottom=0.25, top=0.90, left=0.05, right=0.98, hspace=0.4, wspace=0.1)
-print("Готово! Дашборд запущен. Кликните или ведите мышь по UMAP.")
+# =============================================================================
+# 12. ПОДКЛЮЧАЕМ INTERACTION
+# =============================================================================
+
+fig.canvas.mpl_connect(
+    'button_press_event',
+    update_dashboard
+)
+
+fig.canvas.mpl_connect(
+    'motion_notify_event',
+    update_dashboard
+)
+
+
+# =============================================================================
+# 13. LAYOUT
+# =============================================================================
+
+plt.subplots_adjust(
+    bottom=0.25,
+    top=0.90,
+    left=0.05,
+    right=0.98,
+    hspace=0.4,
+    wspace=0.1
+)
+
+print(
+    "Готово! Дашборд запущен. "
+    "Кликните или ведите мышь по UMAP."
+)
+
 plt.show()
 
 # %%
@@ -986,3 +1526,4 @@ fig.canvas.mpl_connect('button_press_event', on_click)
 plt.subplots_adjust(left=0.05, right=0.98, bottom=0.18, top=0.92, wspace=0.1, hspace=0.3)
 print("Готово! Выбирайте несколько источников: их топографии мощности будут смешиваться в пространстве UMAP.")
 plt.show()
+
