@@ -30,7 +30,8 @@ from pyriemann.geometry.distance import pairwise_distance
 # =============================================================================
 # 1. ЗАГРУЗКА И ПРЕДОБРАБОТКА ДАННЫХ
 # =============================================================================
-fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part2/eeg/TumAle_raw.fif"
+# fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part2/eeg/TumAle_raw.fif"
+fpath = "D:/OS(CURRENT)/data/music/exp2/20.03_g1/Tumyalis_clear.fif"
 raw = mne.io.read_raw_fif(fpath, preload=True)
 sfreq = raw.info['sfreq']
 
@@ -198,11 +199,6 @@ plt.colorbar(label="Расстояние (максимум ограничен 95
 plt.show()
 
 # %%
-from pyriemann.tangentspace import TangentSpace
-import tensorflow as tf
-from umap.parametric_umap import ParametricUMAP
-import numpy as np
-
 n_ch_white = covmats.shape[1]
 
 # =============================================================================
@@ -352,18 +348,36 @@ decoder = tf.keras.Sequential([
 ])
 
 # %%
+import tensorflow as tf
+
+# =============================================================================
+# НАСТРОЙКА CUDA / GPU
+# =============================================================================
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Включаем динамическое выделение памяти для каждой видеокарты
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"✅ CUDA АКТИВНА! Доступно GPU: {len(gpus)}. Используется: {gpus[0]}")
+    except RuntimeError as e:
+        print(e)
+else:
+    print("❌ ВНИМАНИЕ: CUDA не найдена или не настроена. TensorFlow будет использовать CPU!")
+
+# %%
 # =============================================================================
 # НАСТРОЙКА ПАРАМЕТРОВ ОБУЧЕНИЯ (RECOMENDATIONS)
 # =============================================================================
 
 # 1. Параметры Keras (Нейросети)
 batch_size = 64
-keras_epochs = 5  # Сколько раз нейросеть пройдет по всему сгенерированному графу
+keras_epochs = 10  # Сколько раз нейросеть пройдет по всему сгенерированному графу
 loss_weight = 1.0 # Баланс. Если Риманово расстояние падает плохо, увеличьте до 5.0 - 10.0
 
 # 2. Параметры UMAP (Топологии)
-n_neighbors = 15  # Размер локальной окрестности (10-15 оптимально для ЭЭГ)
-umap_n_epochs = 200 # Количество итераций оптимизации графа (для датасетов <10000 точек можно 500)
+n_neighbors = 20  # Размер локальной окрестности (10-15 оптимально для ЭЭГ)
+umap_n_epochs = 500 # Количество итераций оптимизации графа (для датасетов <10000 точек можно 500)
 
 print(f"Обучение ParametricUMAP: N_dim={N_dim}, N_patterns={N_patterns}")
 
