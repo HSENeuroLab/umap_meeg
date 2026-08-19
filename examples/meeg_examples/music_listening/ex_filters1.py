@@ -4,6 +4,9 @@ Created on Wed Oct 22 17:07:11 2025
 
 @author: anton
 """
+import tensorflow as tf
+
+import os
 
 import mne
 import numpy as np
@@ -15,7 +18,6 @@ from scipy.linalg import eigh
 from scipy.linalg import inv, null_space
 
 import sys
-import os
 import tensorflow as tf
 from umap.parametric_umap import ParametricUMAP
 
@@ -30,8 +32,7 @@ from pyriemann.geometry.distance import pairwise_distance
 # =============================================================================
 # 1. ЗАГРУЗКА И ПРЕДОБРАБОТКА ДАННЫХ
 # =============================================================================
-# fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part2/eeg/TumAle_raw.fif"
-fpath = "D:/OS(CURRENT)/data/music/exp2/20.03_g1/Tumyalis_clear.fif"
+fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part2/eeg/TumAle_raw.fif"
 raw = mne.io.read_raw_fif(fpath, preload=True)
 sfreq = raw.info['sfreq']
 
@@ -199,6 +200,8 @@ plt.colorbar(label="Расстояние (максимум ограничен 95
 plt.show()
 
 # %%
+import numpy as np
+
 n_ch_white = covmats.shape[1]
 
 # =============================================================================
@@ -206,7 +209,7 @@ n_ch_white = covmats.shape[1]
 # =============================================================================
 # Нормализация жизненно необходима, чтобы обучаемый шум стартовал в адекватном масштабе
 X_cov_flat = covmats.reshape(covmats.shape[0], -1).astype(np.float32)
-input_dim = X_cov_flat.shape[1]
+input_dim = int(X_cov_flat.shape[1])
 
 # =============================================================================
 # ДЕКОДЕР С ОБУЧАЕМЫМ НЕСФЕРИЧНЫМ ШУМОМ
@@ -214,9 +217,9 @@ input_dim = X_cov_flat.shape[1]
 class SpatialPatternDecoder(tf.keras.layers.Layer):
     def __init__(self, M_channels, N_patterns, **kwargs):
         super().__init__(**kwargs)
-        self.M_channels = M_channels
-        self.N_patterns = N_patterns
-
+        self.M_channels = int(M_channels)
+        self.N_patterns = int(N_patterns)
+        
     def build(self, input_shape):
         # 1. Обучаемые паттерны (матрица A)
         self.A = self.add_weight(
@@ -285,7 +288,7 @@ def riemannian_distance_loss(y_true_flat, y_pred_flat):
     log_eigvals_mid = tf.math.log(tf.maximum(eigvals_mid, eps))
     logC_mid = tf.einsum('bij,bj,bkj->bik', eigvecs_mid, log_eigvals_mid, eigvecs_mid)
 
-    dist_sq = tf.reduce_sum(tf.square(logC_mid), axis=(1, 2))
+    dist_sq = tf.reduce_mean(tf.square(logC_mid), axis=(1, 2))
     return tf.reduce_mean(dist_sq)
 
 def log_euclidean_loss(y_true_flat, y_pred_flat):
@@ -296,160 +299,188 @@ def log_euclidean_loss(y_true_flat, y_pred_flat):
     C_true = tf.reshape(y_true_flat, [-1, M, M])
     C_pred = tf.reshape(y_pred_flat, [-1, M, M])
     
-    # 1. Жесткая симметризация (защита от ошибок float32)
     C_true = 0.5 * (C_true + tf.transpose(C_true, perm=[0, 2, 1]))
     C_pred = 0.5 * (C_pred + tf.transpose(C_pred, perm=[0, 2, 1]))
     
-    # 2. Регуляризация (чтобы собственные значения не были нулями)
-    eps = 1e-4
+    eps = 1e-2
     eye_M = tf.eye(M, dtype=tf.float32)
-    C_true_reg = C_true + eps * eye_M
+    
+    C_true_reg = tf.stop_gradient(C_true + eps * eye_M)
     C_pred_reg = C_pred + eps * eye_M
 
-    # 3. Вычисляем Матричный Логарифм для ТАРГЕТА (C_true)
     eigvals_true, eigvecs_true = tf.linalg.eigh(C_true_reg)
     log_eigvals_true = tf.math.log(tf.maximum(eigvals_true, 1e-9))
-    log_C_true = tf.einsum('bij,bj,bkj->bik', eigvecs_true, log_eigvals_true, eigvecs_true)
+    log_C_true = tf.stop_gradient(tf.einsum('bij,bj,bkj->bik', eigvecs_true, log_eigvals_true, eigvecs_true))
 
-    # 4. Вычисляем Матричный Логарифм для ПРЕДСКАЗАНИЯ (C_pred)
     eigvals_pred, eigvecs_pred = tf.linalg.eigh(C_pred_reg)
     log_eigvals_pred = tf.math.log(tf.maximum(eigvals_pred, 1e-9))
     log_C_pred = tf.einsum('bij,bj,bkj->bik', eigvecs_pred, log_eigvals_pred, eigvecs_pred)
 
-    # 5. Считаем Фробениусово расстояние между логарифмами (это и есть LEM!)
-    # Разница матриц -> возводим каждый элемент в квадрат -> суммируем
     diff = log_C_true - log_C_pred
-    dist_sq = tf.reduce_sum(tf.square(diff), axis=(1, 2))
+    dist_sq = tf.reduce_mean(tf.square(diff), axis=(1, 2))
     
     return tf.reduce_mean(dist_sq)
 
 # =============================================================================
 # ПОДГОТОВКА ДАННЫХ
 # =============================================================================
-N_patterns = 20  # Количество источников
-N_dim = N_patterns  
-
-# =============================================================================
-# ЭНКОДЕР И ДЕКОДЕР (С ОРТОГОНАЛЬНОСТЬЮ)
-# =============================================================================
-# Энкодер переводит матрицу напрямую в 5 мощностей (z)
-encoder = tf.keras.Sequential([
-    tf.keras.layers.InputLayer(shape=(input_dim,)),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(100, activation="relu"),
-    tf.keras.layers.Dense(N_dim, activation="linear", name="z_powers")
-])
-
-decoder = tf.keras.Sequential([
-    tf.keras.layers.InputLayer(shape=(N_dim,)),
-    SpatialPatternDecoder(M_channels=n_ch_white, N_patterns=N_patterns, name="spatial_decoder"),
-    tf.keras.layers.Flatten()
-])
-
-# %%
-import tensorflow as tf
-
-# =============================================================================
-# НАСТРОЙКА CUDA / GPU
-# =============================================================================
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        # Включаем динамическое выделение памяти для каждой видеокарты
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"✅ CUDA АКТИВНА! Доступно GPU: {len(gpus)}. Используется: {gpus[0]}")
-    except RuntimeError as e:
-        print(e)
-else:
-    print("❌ ВНИМАНИЕ: CUDA не найдена или не настроена. TensorFlow будет использовать CPU!")
-
-# %%
-# =============================================================================
-# НАСТРОЙКА ПАРАМЕТРОВ ОБУЧЕНИЯ (RECOMENDATIONS)
-# =============================================================================
-
-# 1. Параметры Keras (Нейросети)
-batch_size = 64
-keras_epochs = 10  # Сколько раз нейросеть пройдет по всему сгенерированному графу
-loss_weight = 1.0 # Баланс. Если Риманово расстояние падает плохо, увеличьте до 5.0 - 10.0
-
-# 2. Параметры UMAP (Топологии)
-n_neighbors = 20  # Размер локальной окрестности (10-15 оптимально для ЭЭГ)
-umap_n_epochs = 500 # Количество итераций оптимизации графа (для датасетов <10000 точек можно 500)
+N_patterns = int(20)  
+N_dim = int(N_patterns)
 
 print(f"Обучение ParametricUMAP: N_dim={N_dim}, N_patterns={N_patterns}")
 
 # =============================================================================
-# КОЛЛБЕКИ KERAS (ДЛЯ ПОЛНОГО КОНТРОЛЯ)
+# ЭНКОДЕР И ДЕКОДЕР
 # =============================================================================
-# ParametricUMAP позволяет передавать любые аргументы напрямую в Keras Model.fit()
-early_stopping = tf.keras.callbacks.EarlyStopping(
-    monitor='loss', 
-    patience=3, 
-    restore_best_weights=True,
-    verbose=1
-)
+encoder = tf.keras.Sequential([
+    tf.keras.Input(shape=(int(input_dim),), dtype=tf.float32),
+    tf.keras.layers.Dense(128, activation="relu"),
+    tf.keras.layers.Dense(128, activation="relu"),
+    tf.keras.layers.Dense(128, activation="relu"),
+    tf.keras.layers.Dense(int(N_dim), activation="linear", name="z_powers")
+])
+
+decoder = tf.keras.Sequential([
+    tf.keras.Input(shape=(int(N_dim),), dtype=tf.float32),
+    SpatialPatternDecoder(
+        M_channels=int(n_ch_white),
+        N_patterns=int(N_patterns),
+        name="spatial_decoder"
+    ),
+    tf.keras.layers.Flatten()
+])
+
+from sklearn.model_selection import train_test_split
+
+# =============================================================================
+# РАЗДЕЛЕНИЕ НА ОБУЧАЮЩУЮ И ВАЛИДАЦИОННУЮ ВЫБОРКИ
+# =============================================================================
+# Индексы для сплита (откладываем 10% данных на валидацию)
+indices = np.arange(len(X_cov_flat))
+train_idx, val_idx = train_test_split(indices, test_size=0.1, random_state=42)
+
+X_train = X_cov_flat[train_idx]
+X_val = X_cov_flat[val_idx]
+
+# Важно: для графа UMAP нужна матрица расстояний ТОЛЬКО между обучающими окнами
+dist_matrix_train = dist_matrix_init[train_idx][:, train_idx]
+
+print(f"Обучающая выборка: {len(X_train)} окон. Валидационная: {len(X_val)} окон.")
+
+# =============================================================================
+# ПОДГОТОВКА ДАННЫХ И КОЛЛБЕКОВ
+# =============================================================================
+batch_size = 64
+n_neighbors = 40 
+loss_weight = 20.0
+umap_n_epochs = 20
+
+class HonestEarlyStoppingCallback(tf.keras.callbacks.Callback):
+    def __init__(self, X_train, X_val, patience=5):
+        super().__init__()
+        self.X_train = X_train
+        self.X_val = X_val
+        self.patience = patience
+        self.best_loss = np.inf
+        self.wait = 0
+        self.best_weights = None
+
+    def _compute_honest_recon_loss(self, X_data):
+        batch_sz = 256
+        total_loss = 0.0
+        n_batches = int(np.ceil(len(X_data) / batch_sz))
+        
+        for i in range(n_batches):
+            X_batch = X_data[i * batch_sz : (i + 1) * batch_sz]
+            z = self.model.encoder(X_batch, training=False)
+            X_recon = self.model.decoder(z, training=False)
+            
+            # Считаем лосс для батча и умножаем на его размер для правильного усреднения
+            batch_loss = riemannian_distance_loss(X_batch, X_recon).numpy()
+            total_loss += batch_loss * len(X_batch)
+            
+        return total_loss / len(X_data)
+
+    def on_epoch_end(self, epoch, logs=None):
+        # 1. Считаем честную ошибку для валидации
+        val_recon_loss = self._compute_honest_recon_loss(self.X_val)
+        
+        # 2. Считаем честную ошибку для тренировки (берем случайные окна для скорости)
+        # Размер подвыборки делаем равным валидации, чтобы оценка была честной и быстрой
+        idx = np.random.choice(len(self.X_train), len(self.X_val), replace=False)
+        train_recon_loss = self._compute_honest_recon_loss(self.X_train[idx])
+        
+        # 3. Записываем в логи Keras
+        if logs is not None:
+            logs['honest_train_loss'] = train_recon_loss
+            logs['honest_val_loss'] = val_recon_loss
+            
+        print(f" — Честный Recon Loss -> Train: {train_recon_loss:.4f} | Val: {val_recon_loss:.4f}")
+        
+        # 4. Логика ранней остановки (ориентируемся только на Val Loss)
+        if val_recon_loss < self.best_loss:
+            self.best_loss = val_recon_loss
+            self.wait = 0
+            self.best_weights = self.model.get_weights()
+        else:
+            self.wait += 1
+            if self.wait >= self.patience:
+                print(f"\n[EarlyStopping] Остановка: честный val_loss не улучшается {self.patience} эпох.")
+                self.model.stop_training = True
+                self.model.set_weights(self.best_weights)
+                print("[EarlyStopping] Лучшие веса восстановлены!")
 
 keras_fit_args = {
-    "callbacks": [early_stopping],
-    # "validation_split": 0.1 # Можно добавить, если используете валидационную выборку
+    "callbacks": [HonestEarlyStoppingCallback(X_train, X_val, patience=5)]
 }
 
 # =============================================================================
-# ИНИЦИАЛИЗАЦИЯ PARAMETRIC UMAP
+# ИНИЦИАЛИЗАЦИЯ И ЗАПУСК PARAMETRIC UMAP
 # =============================================================================
 embedder = ParametricUMAP(
     encoder=encoder,
     decoder=decoder,
     n_components=N_dim, 
     dims=(input_dim,),
-    metric="precomputed", # Обязательно, так как мы передаем матрицу dist_matrix_init
+    metric="precomputed", 
     n_neighbors=n_neighbors,
-    n_epochs=umap_n_epochs, # Параметр алгоритма UMAP
-    batch_size=batch_size,
+    # n_epochs=umap_n_epochs, 
+    # batch_size=batch_size,
     parametric_reconstruction=True,
-    autoencoder_loss=True, # Градиенты от декодера текут в энкодер
-    parametric_reconstruction_loss_fcn=riemannian_distance_loss,
+    autoencoder_loss=True, 
+    parametric_reconstruction_loss_fcn=riemannian_distance_loss, 
     parametric_reconstruction_loss_weight=loss_weight,
-    keras_fit_kwargs=keras_fit_args, # Проброс аргументов в Keras
+    reconstruction_validation=X_val, 
+    keras_fit_kwargs=keras_fit_args, 
     verbose=True
 )
 
-# =============================================================================
-# ТОНКАЯ НАСТРОЙКА ВНУТРЕННИХ ПАРАМЕТРОВ КЛАССА
-# =============================================================================
-# По умолчанию ParametricUMAP делит 1 эпоху на 10 частей (loss_report_frequency = 10) 
-# для более частого вывода логов. 
-# Мы устанавливаем это значение в 1, чтобы 1 Keras-эпоха строго равнялась 1 проходу по графу.
-embedder.loss_report_frequency = 1 
+# embedder.loss_report_frequency = 1
+# embedder.n_training_epochs = 10      
 
-# Устанавливаем количество реальных проходов нейросети по датасету[cite: 4]
-embedder.n_training_epochs = keras_epochs 
+embedder.fit(X_train, precomputed_distances=dist_matrix_train)
 
+# %%
 # =============================================================================
-# ЗАПУСК ОБУЧЕНИЯ
-# =============================================================================
-# Библиотека сама:
-# 1. Построит нечеткие симплициальные множества на основе dist_matrix_init[cite: 4]
-# 2. Сгенерирует tf.data.Dataset из пар точек (to_x, from_x)[cite: 4]
-# 3. Вызовет Keras .fit()[cite: 4]
-embedder.fit(X_cov_flat, precomputed_distances=dist_matrix_init)
-
-# =============================================================================
-# ВИЗУАЛИЗАЦИЯ И ИЗВЛЕЧЕНИЕ ПАТТЕРНОВ
+# ВИЗУАЛИЗАЦИЯ
 # =============================================================================
 import matplotlib.pyplot as plt
 
-# Вытягиваем историю напрямую из скрытого атрибута объекта
 history = embedder._history
 
 plt.figure(figsize=(10, 5))
-plt.plot(history['loss'], label='Total Loss (UMAP CE + Riemannian)', color='purple', linewidth=2)
-plt.title('График обучения Parametric UMAP')
+
+# Исходный общий лосс (UMAP + Recon)
+plt.plot(history['loss'], label='Total Train Loss (UMAP + Recon)', color='purple', linewidth=2, alpha=0.5, linestyle=':')
+
+# Наши честные лоссы реконструкции
+if 'honest_train_loss' in history and 'honest_val_loss' in history:
+    plt.plot(history['honest_train_loss'], label='Honest Train Recon Loss', color='blue', linewidth=2)
+    plt.plot(history['honest_val_loss'], label='Honest Val Recon Loss', color='green', linewidth=2)
+
+plt.title('Динамика обучения (Ошибки реконструкции матриц ковариации)')
 plt.xlabel('Эпохи (Keras)')
-plt.ylabel('Loss')
+plt.ylabel('Loss (Риманово расстояние)')
 plt.legend()
 plt.grid(True, linestyle='--', alpha=0.7)
 plt.show()
@@ -526,12 +557,20 @@ A_global = A_learned_raw / np.linalg.norm(A_learned_raw, axis=0)
 # ТЕПЕРЬ A_global - ЭТО И ЕСТЬ ГОТОВЫЕ ПАТТЕРНЫ В ПРОСТРАНСТВЕ СЕНСОРОВ!
 found_patterns = [A_global[:, i] for i in range(N_patterns)]
 
-# 4. Фильтры Хауфе (математика остается прежней)
+# 4. Фильтры Хауфе (с Тихоновской регуляризацией)
 C_global_mean = np.mean(covmats, axis=0)
-C_global_inv = np.linalg.pinv(C_global_mean)
-found_filters = [C_global_inv @ A_global[:, i] for i in range(N_patterns)]
 
-print(f"Модели обучены end-to-end. Размерность powers: {powers.shape}")
+# Коэффициент регуляризации (обычно 1e-4 или 1e-5 отлично работают для ЭЭГ)
+alpha = 1e-4  
+
+# Добавляем единичную матрицу, масштабированную на след C_global_mean
+I = np.eye(C_global_mean.shape[0])
+C_global_reg = C_global_mean + alpha * np.trace(C_global_mean) * I
+
+# Обращаем регуляризованную матрицу (теперь можно безопасно использовать обычный inv)
+C_global_inv = np.linalg.inv(C_global_reg)
+
+found_filters = [C_global_inv @ A_global[:, i] for i in range(N_patterns)]
 
 # %%
 import numpy as np
@@ -600,7 +639,7 @@ p_vals_norm = p_vals / np.std(p_vals)
 filtered_powers_norm = filtered_powers / np.std(filtered_powers)
 
 unique_labels_ordered = []
-for lab in labels:
+for lab in window_labels:
     if lab not in unique_labels_ordered:
         unique_labels_ordered.append(lab)
 
