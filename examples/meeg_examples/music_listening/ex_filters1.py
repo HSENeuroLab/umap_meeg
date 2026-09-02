@@ -32,7 +32,9 @@ from pyriemann.geometry.distance import pairwise_distance
 # =============================================================================
 # 1. ЗАГРУЗКА И ПРЕДОБРАБОТКА ДАННЫХ
 # =============================================================================
-fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part2/eeg/TumAle_raw.fif"
+# fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part2/eeg/TumAle_raw.fif"
+fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part2/eeg/DmiAna_raw.fif"
+# fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part1/eeg/10_07_g1_2223_raw.fif"
 raw = mne.io.read_raw_fif(fpath, preload=True)
 sfreq = raw.info['sfreq']
 
@@ -40,7 +42,7 @@ new_descriptions = [
     'RS_EC_1', 'RS_EO_1', '2Hz', '05Hz', '4Hz', '1Hz', '3Hz',
     'NoRy_1', 'Waltz_1', 'Waltz_2', 'NoRy_2', 'NoRy_3', 'Waltz_3',
     'NoRy_4', 'Waltz_4', 'NoRy_5', 'Waltz_5', 'RS_EC_2', 'RS_EO_2',
-    'Waltz_6', 'Waltz_7', 'Waltz_8'
+    # 'Waltz_6', 'Waltz_7', 'Waltz_8'
 ]
 
 descriptions = raw.annotations.description
@@ -143,7 +145,7 @@ X_windows_band = []
 X_windows_unfilt = []
 window_labels = []
 
-raw_band = raw.copy().filter(l_freq=15, h_freq=25).pick_types(eeg=True)
+raw_band = raw.copy().filter(l_freq=15,h_freq=25)
 raw_unfilt = raw.copy().pick_types(eeg=True)
 
 for annot in raw.annotations:
@@ -174,46 +176,305 @@ X_windows_ssd_proj = np.zeros((n_windows, n_components_ssd, n_times))
 for i in range(n_windows):
     X_windows_ssd_proj[i] = W_ssd.T @ X_windows_band[i]
 
-covmats_ssd = Covariances().fit_transform(X_windows_ssd_proj)
+covmats_ssd = Covariances().fit_transform(X_windows_ssd_proj / np.std(X_windows_ssd_proj))
+# covmats = Covariances().fit_transform(X_windows_band / np.std(X_windows_band))
 covmats = Covariances().fit_transform(X_windows_band / np.std(X_windows_band))
 
-print("Отбеливание ковариационных матриц по среднему арифметическому...")
-C_avg = np.mean(covmats_ssd, axis=0)                     
-C_avg_invsqrt = invsqrtm(C_avg)                       
-C_avg_sqrt = np.linalg.inv(C_avg_invsqrt)             
-covmats_white = C_avg_invsqrt @ covmats_ssd @ C_avg_invsqrt
+# print("Отбеливание ковариационных матриц по среднему арифметическому...")
+# C_avg = np.mean(covmats_ssd, axis=0)                     
+# C_avg_invsqrt = invsqrtm(C_avg)                       
+# C_avg_sqrt = np.linalg.inv(C_avg_invsqrt)             
+# covmats_white = C_avg_invsqrt @ covmats_ssd @ C_avg_invsqrt
 
-dist_matrix_init = pairwise_distance(covmats_white, metric='riemann')
+# %%
+# 1. Вычисляем чистые, сырые ковариации
+covmats = Covariances(estimator='oas').fit_transform(X_windows_band / np.std(X_windows_band))
+
+# 2. ИЩЕМ МИНИМАЛЬНЫЙ GLOBAL_EPS ЧЕРЕЗ АНАЛИЗ СПЕКТРА
+# Вычисляем собственные значения для всех матриц: форма (N_windows, M_channels)
+eigvals = np.linalg.eigvalsh(covmats)
+
+max_eig = np.max(eigvals, axis=1)  # Максимальные собственные значения каждой эпохи
+min_eig = np.min(eigvals, axis=1)  # Минимальные собственные значения каждой эпохи
+
+target_kappa = 1e6  # Максимально допустимое число обусловленности (безопасно для логарифма)
+
+# Математика: нам нужно, чтобы (max_eig + eps) / (min_eig + eps) <= target_kappa
+# Поскольку eps мало по сравнению с max_eig, упрощаем: max_eig / (min_eig + eps) <= target_kappa
+# Отсюда: eps >= (max_eig / target_kappa) - min_eig
+required_eps = (max_eig / target_kappa) - min_eig
+
+# Также eps обязан вытягивать любые отрицательные собственные значения (ошибки округления) в плюс
+strict_positivity_eps = -min_eig
+
+# Для каждой матрицы находим нужный ей eps, и берем худший случай по всему датасету
+eps_candidates = np.maximum(required_eps, strict_positivity_eps)
+global_eps = np.max(eps_candidates) + np.finfo(float).eps
+
+global_eps = max(0.0, global_eps) # Защита, если матрицы уже идеальны
+
+print(f"Найденный минимальный global_eps: {global_eps:.4e}")
+
+# 3. Применяем единую регуляризацию ко всем окнам
+M = covmats.shape[1]
+covmats_reg = covmats + global_eps * np.eye(M)
+
+# 4. ОЦЕНИВАЕМ ИСКРИВЛЕНИЕ ПРОСТРАНСТВА (Distortion)
+# Возьмем среднюю ковариационную матрицу (как центр нашего пространства)
+C_mean = np.mean(covmats, axis=0)
+eigvals_mean = np.linalg.eigvalsh(C_mean)
+
+# Искривление Риманова пространства из-за добавления eps * I вычисляется аналитически.
+# Поскольку I не меняет базис, расстояние d(C, C + eps*I) = sqrt( sum( ln^2(1 + eps / lambda_i) ) )
+# Мы игнорируем lambda <= 0, так как исходно расстояние там бесконечно.
+valid_eigvals = eigvals_mean[eigvals_mean > 0]
+distortion = np.sqrt(np.sum(np.log(1 + global_eps / valid_eigvals)**2))
+
+print(f"Римановское искажение (дистанция) центра пространства: {distortion:.4f}")
+
+# Для контекста: посмотрим, как eps повлиял на самую слабую и самую сильную ось
+print(f"Искажение главной оси (lambda={np.max(valid_eigvals):.4e}): {np.log(1 + global_eps/np.max(valid_eigvals)):.4e}")
+print(f"Искажение слабой оси (lambda={np.min(valid_eigvals):.4e}): {np.log(1 + global_eps/np.min(valid_eigvals)):.4f}")
+
+# 5. Считаем классическую Риманову метрику (AIRM)
+print("Расчет матрицы попарных расстояний (AIRM)")
+dists_init = pairwise_distance(covmats, metric='riemann')
+
+# %%
+covmats_reg = covmats.copy()
+dist_matrix_init = dists_init.copy()
 
 # %%
 import matplotlib.pyplot as plt
 import numpy as np
 
-# 1. Находим пороговое значение для 95-го процентиля
-threshold = np.percentile(dist_matrix_init, 95)
+plt.hist(eigvals[:,2], bins=1000, rwidth=0.85)
+plt.show()
 
-# 2. Отображаем всю матрицу целиком, ограничив верхний диапазон цвета
-plt.imshow(dist_matrix_init, vmax=threshold)
+# %%
+from pyriemann.estimation import Covariances
+from pyriemann.geometry.distance import pairwise_distance
+import numpy as np
 
-# 3. Добавляем цветовую шкалу
-plt.colorbar(label="Расстояние (максимум ограничен 95-м процентилем)")
+# 1. Вычисляем чистые, сырые ковариации (Sample Covariance Matrix)
+covmats = Covariances(estimator='cov').fit_transform(X_windows_band)
+
+# 2. Вычисляем среднюю энергию (след) по всему датасету
+mean_trace = np.mean(np.trace(covmats, axis1=1, axis2=2))
+
+# 3. Задаем глобальный порог шума 
+# (например, 1e-4 от средней энергии, что отлично совпадает с твоим smoothing_factor в слое)
+global_eps = 1e-4 * mean_trace 
+# global_eps = 1e-6
+
+# 4. Применяем единую регуляризацию ко всем окнам
+M = covmats.shape[1]
+covmats_reg = covmats + global_eps * np.eye(M)
+
+# 5. Считаем классическую Риманову метрику (AIRM)
+# Теперь pyriemann отработает без ошибок, а геометрия будет идеальной для UMAP
+print("Расчет матрицы попарных расстояний (AIRM)...")
+dist_matrix_init = pairwise_distance(covmats_reg, metric='riemann')
+
+# %%
+import numpy as np
+from tqdm import tqdm
+from joblib import Parallel, delayed
+
+def process_chunk_kl(start_idx, end_idx, covmats, covmats_inv, M):
+    """Функция-воркер для обработки куска строк (Kullback-Sym)"""
+    chunk_results = []
+    for i in range(start_idx, end_idx):
+        C_j_subset = covmats[i+1:]
+        if len(C_j_subset) == 0:
+            chunk_results.append((i, []))
+            continue
+            
+        C_inv_i = covmats_inv[i]
+        C_i = covmats[i]
+        C_inv_j_subset = covmats_inv[i+1:]
+        
+        # МАГИЯ ЛИНЕЙНОЙ АЛГЕБРЫ: 
+        # Tr(A^-1 * B) для симметричных матриц равен сумме поэлементного умножения!
+        # Это избавляет от тяжелого матричного умножения @
+        term1 = np.sum(C_inv_i * C_j_subset, axis=(1, 2))
+        term2 = np.sum(C_inv_j_subset * C_i, axis=(1, 2))
+        
+        # Формула Джеффриса: 0.5 * (Tr(A^-1 B) + Tr(B^-1 A)) - M
+        d2 = 0.5 * (term1 + term2) - M
+        
+        # Защита от микроскопических минусов из-за float
+        chunk_results.append((i, np.maximum(d2, 0.0)))
+        
+    return chunk_results
+
+def compute_super_fast_kullback_sym(covmats, n_jobs=-1, chunk_size=100):
+    print("Предвычисление обратных матриц...")
+    N, M, _ = covmats.shape
+    
+    # Считаем инверсию всего один раз для каждой матрицы
+    covmats_inv = np.linalg.inv(covmats)
+    
+    dist_matrix = np.zeros((N, N))
+    
+    # Разбиваем индексы на чанки (размер чанка можно сделать больше, так как операции легкие)
+    chunks = [(i, min(i + chunk_size, N)) for i in range(0, N, chunk_size)]
+    
+    print("Расчет матрицы попарных расстояний Kullback-Sym (Мультипроцессинг)...")
+    results = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(process_chunk_kl)(start, end, covmats, covmats_inv, M) 
+        for start, end in tqdm(chunks, desc="Chunks")
+    )
+    
+    # Собираем всё в матрицу
+    for chunk_res in results:
+        for i, row_data in chunk_res:
+            if len(row_data) > 0:
+                dist_matrix[i, i+1:] = row_data
+                
+    dist_matrix = dist_matrix + dist_matrix.T
+    return dist_matrix
+
+# ЗАПУСК (Подаем матрицы, которые УЖЕ регуляризованы вашим global_eps)
+dist_matrix_chi2 = compute_super_fast_kullback_sym(covmats_reg)
+
+# %%
+import numpy as np
+from tqdm import tqdm
+from joblib import Parallel, delayed
+
+def process_chunk(start_idx, end_idx, covmats_reg, covmats_sqrt, traces, eps):
+    """Функция-воркер для обработки куска строк в отдельном процессе"""
+    chunk_results = []
+    for i in range(start_idx, end_idx):
+        C_j_subset = covmats_reg[i+1:]
+        if len(C_j_subset) == 0:
+            chunk_results.append((i, []))
+            continue
+            
+        C_sqrt_i = covmats_sqrt[i]
+        
+        # Перемножаем батчом
+        C_mid = C_sqrt_i @ C_j_subset @ C_sqrt_i
+        C_mid = 0.5 * (C_mid + np.transpose(C_mid, axes=(0, 2, 1)))
+        
+        # Находим собственные значения
+        eigvals_mid = np.linalg.eigvalsh(C_mid)
+        trace_mid_sqrt = np.sum(np.sqrt(np.maximum(eigvals_mid, eps)), axis=1)
+        
+        # Считаем Вассерштейна
+        d2 = traces[i] + traces[i+1:] - 2.0 * trace_mid_sqrt
+        chunk_results.append((i, np.maximum(d2, 0.0)))
+        
+    return chunk_results
+
+def compute_super_fast_wasserstein(covmats, eps=0, n_jobs=-1, chunk_size=50):
+    print("Предвычисление матричных корней...")
+    N, M, _ = covmats.shape
+    
+    eye_M = np.eye(M)
+    covmats_reg = covmats + eps * eye_M
+    traces = np.trace(covmats_reg, axis1=1, axis2=2)
+    
+    eigvals, eigvecs = np.linalg.eigh(covmats_reg)
+    eigvals_sqrt = np.sqrt(np.maximum(eigvals, eps))
+    covmats_sqrt = (eigvecs * eigvals_sqrt[:, np.newaxis, :]) @ np.transpose(eigvecs, axes=(0, 2, 1))
+    
+    dist_matrix = np.zeros((N, N))
+    
+    # Разбиваем индексы на чанки
+    chunks = [(i, min(i + chunk_size, N)) for i in range(0, N, chunk_size)]
+    
+    print("Расчет матрицы попарных расстояний (Мультипроцессинг)...")
+    # Используем backend "loky" (процессы), чтобы обойти все ограничения Python
+    results = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(process_chunk)(start, end, covmats_reg, covmats_sqrt, traces, eps) 
+        for start, end in tqdm(chunks, desc="Chunks")
+    )
+    
+    # Собираем всё в матрицу
+    for chunk_res in results:
+        for i, row_data in chunk_res:
+            if len(row_data) > 0:
+                dist_matrix[i, i+1:] = row_data
+                
+    dist_matrix = dist_matrix + dist_matrix.T
+    return dist_matrix
+
+eigvals, eigvecs = np.linalg.eigh(covmats)
+
+eigvals = np.maximum(eigvals, 0.0)
+
+# U @ diag(lambda) @ U.T для каждой матрицы
+covmats_psd = np.einsum(
+    'nij,nj,nkj->nik',
+    eigvecs,
+    eigvals,
+    eigvecs
+)
+
+dist_matrix_init = compute_super_fast_wasserstein(covmats_psd, eps=0)
+
+# %%
+import matplotlib.pyplot as plt
+import umap
+
+reducer = umap.UMAP(n_components=2, n_neighbors=20, metric='precomputed')
+coords = reducer.fit_transform(dist_matrix_init)
+
+plt.figure(figsize=(8, 6))
+plt.scatter(coords[:, 0], coords[:, 1], s=5, cmap='Spectral')
+
+plt.title('UMAP проекция матрицы расстояний')
+plt.xlabel('UMAP 1')
+plt.ylabel('UMAP 2')
+plt.colorbar() 
+plt.show()
+
+# %%
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 1. Находим пороговое значение (например, 85-й или 95-й процентиль)
+# Чем ниже процентиль, тем сильнее поднимется контраст для малых значений
+percentile_value = 80
+threshold = np.percentile(dist_matrix_init, percentile_value)
+
+# 2. Отображаем матрицу
+# Добавлена палитра (cmap), которая хорошо показывает контраст (например, 'viridis' или 'inferno')
+plt.figure(figsize=(8, 6))
+im = plt.imshow(dist_matrix_init, vmax=threshold, cmap='viridis')
+
+# 3. Настраиваем цветовую шкалу
+# Используем extend='max', чтобы показать, что на графике есть значения выше максимума шкалы
+cbar = plt.colorbar(im, extend='max')
+cbar.set_label(f"Расстояние (максимум ограничен {percentile_value}-м процентилем)")
+
+plt.title("Матрица расстояний с повышенным контрастом")
 plt.show()
 
 # %%
 import numpy as np
 
-n_ch_white = covmats.shape[1]
+n_ch_white = covmats_reg.shape[1]
 
 # =============================================================================
-# ПОДГОТОВКА ДАННЫХ
+# ПОДГОТОВКА ДАННЫХ (УНИКАЛЬНЫЕ ЭЛЕМЕНТЫ)
 # =============================================================================
-# Нормализация жизненно необходима, чтобы обучаемый шум стартовал в адекватном масштабе
-X_cov_flat = covmats.reshape(covmats.shape[0], -1).astype(np.float32)
-input_dim = int(X_cov_flat.shape[1])
+M_channels = covmats_reg.shape[1]
 
-# =============================================================================
-# ДЕКОДЕР С ОБУЧАЕМЫМ НЕСФЕРИЧНЫМ ШУМОМ
-# =============================================================================
+# Индексы верхней треугольной матрицы
+idx_i, idx_j = np.triu_indices(M_channels)
+
+# Множители: 1.0 для диагонали, sqrt(2) для внедиагональных
+multipliers = np.where(idx_i == idx_j, 1.0, np.sqrt(2.0)).astype(np.float32)
+
+# Вытаскиваем уникальные элементы и сразу масштабируем
+X_cov_flat = (covmats_reg[:, idx_i, idx_j] * multipliers).astype(np.float32)
+
+input_dim = int(X_cov_flat.shape[1]) # Теперь размерность M*(M+1)/2
+print(f"Новая размерность входа: {input_dim}")
+
 class SpatialPatternDecoder(tf.keras.layers.Layer):
     def __init__(self, M_channels, N_patterns, **kwargs):
         super().__init__(**kwargs)
@@ -221,7 +482,6 @@ class SpatialPatternDecoder(tf.keras.layers.Layer):
         self.N_patterns = int(N_patterns)
         
     def build(self, input_shape):
-        # 1. Обучаемые паттерны (матрица A)
         self.A = self.add_weight(
             shape=(self.M_channels, self.N_patterns),
             initializer=tf.keras.initializers.RandomNormal(stddev=0.1),
@@ -229,66 +489,92 @@ class SpatialPatternDecoder(tf.keras.layers.Layer):
             name="A_patterns"
         )
         
-        # 2. ОБУЧАЕМЫЙ ГЛОБАЛЬНЫЙ ШУМ (индивидуальный для каждого сенсора)
-        # Инициализируем отрицательным значением, чтобы после softplus шум стартовал с малого значения
         self.noise_log = self.add_weight(
             shape=(self.M_channels,),
             initializer=tf.keras.initializers.Constant(-3.0),
             trainable=True,
             name="sensor_noise"
         )
+        
+        # Подготовка констант для векторизации
+        i, j = np.triu_indices(self.M_channels)
+        self.flat_indices = tf.constant(i * self.M_channels + j, dtype=tf.int32)
+        self.multipliers = tf.constant(np.where(i == j, 1.0, np.sqrt(2.0)), dtype=tf.float32)
 
     def call(self, z):
-        # Нормализуем столбцы A
         A_norm = tf.math.l2_normalize(self.A, axis=0)
-        
         P = tf.exp(z)
         
-        # Реконструкция полезного сигнала: A * P * A^T
         C_signal = tf.einsum("mf,bf,lf->bml", A_norm, P, A_norm)
-        
-        # Превращаем обучаемый вектор в строго положительную дисперсию (через softplus)
         noise_variance = tf.math.softplus(self.noise_log)
-        
-        # Создаем диагональную матрицу шума
         noise_diag = tf.linalg.diag(noise_variance)
         
-        # Итоговая ковариация: Сигнал + Глобальный несферичный шум
+        # Полная матрица (batch, M, M)
         C_recon = C_signal + noise_diag
-        return C_recon
-    
+        
+        # Выборка уникальных элементов и масштабирование
+        C_recon_flat = tf.reshape(C_recon, [-1, self.M_channels * self.M_channels])
+        vecs = tf.gather(C_recon_flat, self.flat_indices, axis=1)
+        
+        return vecs * self.multipliers # Выход: (batch, M*(M+1)/2)
+
+def build_unvec_matrix(M):
+    """Создает матрицу для быстрого преобразования вектора обратно в симметричную матрицу"""
+    D = M * (M + 1) // 2
+    W = np.zeros((D, M * M), dtype=np.float32)
+    idx_i, idx_j = np.triu_indices(M)
+    for k, (i, j) in enumerate(zip(idx_i, idx_j)):
+        if i == j:
+            W[k, i * M + j] = 1.0
+        else:
+            # Делим на sqrt(2), чтобы снять примененный ранее масштаб
+            W[k, i * M + j] = 1.0 / np.sqrt(2.0)
+            W[k, j * M + i] = 1.0 / np.sqrt(2.0)
+    return W
+
+# Инициализируем константу один раз
+W_UNVEC = tf.constant(build_unvec_matrix(n_ch_white), dtype=tf.float32)
+
+def reconstruct_sym_matrix(vecs, M):
+    """Дифференцируемое восстановление (batch, D) -> (batch, M, M)"""
+    C_flat = tf.matmul(vecs, W_UNVEC)
+    return tf.reshape(C_flat, [-1, M, M])
+
 def riemannian_distance_loss(y_true_flat, y_pred_flat):
     y_true_flat = tf.cast(y_true_flat, tf.float32)
     y_pred_flat = tf.cast(y_pred_flat, tf.float32)
 
     M = n_ch_white  
     
-    C_true = tf.reshape(y_true_flat, [-1, M, M])
-    C_pred = tf.reshape(y_pred_flat, [-1, M, M])
+    C_true = reconstruct_sym_matrix(y_true_flat, M)
+    C_pred = reconstruct_sym_matrix(y_pred_flat, M)
     
-    smoothing_factor = 1e-2  
-    eye_M = tf.eye(M, dtype=tf.float32)
-    
-    # Добавляем сглаживание к матрицам
-    C_true_reg = C_true + smoothing_factor * eye_M
-    C_pred_reg = C_pred + smoothing_factor * eye_M
+    C_true = 0.5 * (C_true + tf.transpose(C_true, [0, 2, 1]))
+    C_pred = 0.5 * (C_pred + tf.transpose(C_pred, [0, 2, 1]))
 
-    # Защитная константа для стабильности градиентов
-    eps = 1e-7
+    # 1. Отсекаем построение градиентного графа для истинных данных
+    C_true = tf.stop_gradient(C_true)
+        
+    # 2. Безопасный порог для float32 (машинный эпсилон ~1.19e-7)
+    eps = 1e-4
 
-    # Риманово расстояние
-    eigvals_true, eigvecs_true = tf.linalg.eigh(C_true_reg)
+    # Шаг 1: C_true^{-1/2}
+    eigvals_true, eigvecs_true = tf.linalg.eigh(C_true)
     inv_sqrt_eigvals = 1.0 / tf.sqrt(tf.maximum(eigvals_true, eps))
     C_true_invsqrt = tf.einsum('bij,bj,bkj->bik', eigvecs_true, inv_sqrt_eigvals, eigvecs_true)
 
-    C_mid = tf.einsum('bij,bjk,bkl->bil', C_true_invsqrt, C_pred_reg, C_true_invsqrt)
-    C_mid = 0.5 * (C_mid + tf.transpose(C_mid, [0, 2, 1])) 
+    # Шаг 2: C_true^{-1/2} * C_pred * C_true^{-1/2}
+    C_mid = tf.einsum('bij,bjk,bkl->bil', C_true_invsqrt, C_pred, C_true_invsqrt)
+    C_mid = 0.5 * (C_mid + tf.transpose(C_mid, perm=[0, 2, 1])) 
 
-    eigvals_mid, eigvecs_mid = tf.linalg.eigh(C_mid)
+    # Шаг 3: Собственные значения полученной матрицы
+    eigvals_mid, _ = tf.linalg.eigh(C_mid) 
     log_eigvals_mid = tf.math.log(tf.maximum(eigvals_mid, eps))
-    logC_mid = tf.einsum('bij,bj,bkj->bik', eigvecs_mid, log_eigvals_mid, eigvecs_mid)
 
-    dist_sq = tf.reduce_mean(tf.square(logC_mid), axis=(1, 2))
+    # Шаг 4: Считаем дистанцию напрямую по собственным значениям    
+    # dist_sq = tf.reduce_sum(tf.square(log_eigvals_mid), axis=1) / tf.cast(M * M, tf.float32)
+    dist_sq = tf.sqrt(tf.reduce_sum(tf.square(log_eigvals_mid), axis=1))
+
     return tf.reduce_mean(dist_sq)
 
 def log_euclidean_loss(y_true_flat, y_pred_flat):
@@ -296,35 +582,67 @@ def log_euclidean_loss(y_true_flat, y_pred_flat):
     y_pred_flat = tf.cast(y_pred_flat, tf.float32)
 
     M = n_ch_white  
-    C_true = tf.reshape(y_true_flat, [-1, M, M])
-    C_pred = tf.reshape(y_pred_flat, [-1, M, M])
+    C_true = reconstruct_sym_matrix(y_true_flat, M)
+    C_pred = reconstruct_sym_matrix(y_pred_flat, M)
     
     C_true = 0.5 * (C_true + tf.transpose(C_true, perm=[0, 2, 1]))
     C_pred = 0.5 * (C_pred + tf.transpose(C_pred, perm=[0, 2, 1]))
-    
-    eps = 1e-2
-    eye_M = tf.eye(M, dtype=tf.float32)
-    
-    C_true_reg = tf.stop_gradient(C_true + eps * eye_M)
-    C_pred_reg = C_pred + eps * eye_M
+        
+    C_true = tf.stop_gradient(C_true)
 
-    eigvals_true, eigvecs_true = tf.linalg.eigh(C_true_reg)
+    eigvals_true, eigvecs_true = tf.linalg.eigh(C_true)
     log_eigvals_true = tf.math.log(tf.maximum(eigvals_true, 1e-9))
     log_C_true = tf.stop_gradient(tf.einsum('bij,bj,bkj->bik', eigvecs_true, log_eigvals_true, eigvecs_true))
 
-    eigvals_pred, eigvecs_pred = tf.linalg.eigh(C_pred_reg)
+    eigvals_pred, eigvecs_pred = tf.linalg.eigh(C_pred)
     log_eigvals_pred = tf.math.log(tf.maximum(eigvals_pred, 1e-9))
     log_C_pred = tf.einsum('bij,bj,bkj->bik', eigvecs_pred, log_eigvals_pred, eigvecs_pred)
 
     diff = log_C_true - log_C_pred
-    dist_sq = tf.reduce_mean(tf.square(diff), axis=(1, 2))
+    dist_sq = tf.reduce_sum(tf.square(diff), axis=(1, 2))
     
     return tf.reduce_mean(dist_sq)
+
+def wasserstein_distance_loss(y_true_flat, y_pred_flat):
+    y_true_flat = tf.cast(y_true_flat, tf.float32)
+    y_pred_flat = tf.cast(y_pred_flat, tf.float32)
+
+    M = n_ch_white  
+    C_true = reconstruct_sym_matrix(y_true_flat, M)
+    C_pred = reconstruct_sym_matrix(y_pred_flat, M)
+    
+    eps = 0 
+
+    # 1. Вычисляем следы исходных матриц
+    tr_true = tf.linalg.trace(C_true)
+    tr_pred = tf.linalg.trace(C_pred)
+
+    # 2. Вычисляем корень из C_true через собственные значения
+    eigvals_true, eigvecs_true = tf.linalg.eigh(C_true)
+    sqrt_eigvals_true = tf.sqrt(tf.maximum(eigvals_true, eps))
+    C_true_sqrt = tf.einsum('bij,bj,bkj->bik', eigvecs_true, sqrt_eigvals_true, eigvecs_true)
+
+    # 3. Центральная матрица C_mid = C_true^{1/2} * C_pred * C_true^{1/2}
+    C_mid = tf.einsum('bij,bjk,bkl->bil', C_true_sqrt, C_pred, C_true_sqrt)
+    C_mid = 0.5 * (C_mid + tf.transpose(C_mid, perm=[0, 2, 1])) 
+
+    # 4. След корня из C_mid (сумма корней её собственных значений)
+    eigvals_mid, _ = tf.linalg.eigh(C_mid) 
+    tr_mid_sqrt = tf.reduce_sum(tf.sqrt(tf.maximum(eigvals_mid, eps)), axis=1)
+
+    # 5. Итоговое расстояние Вассерштейна
+    d2 = tr_true + tr_pred - 2.0 * tr_mid_sqrt
+    
+    # Защита от отрицательных значений из-за погрешности float32
+    d2 = tf.maximum(d2, 0.0)
+    
+    # Усредняем и масштабируем (делим на M для совместимости градиентов)
+    return tf.reduce_mean(d2 / tf.cast(M, tf.float32))
 
 # =============================================================================
 # ПОДГОТОВКА ДАННЫХ
 # =============================================================================
-N_patterns = int(20)  
+N_patterns = int(40)
 N_dim = int(N_patterns)
 
 print(f"Обучение ParametricUMAP: N_dim={N_dim}, N_patterns={N_patterns}")
@@ -332,22 +650,48 @@ print(f"Обучение ParametricUMAP: N_dim={N_dim}, N_patterns={N_patterns}"
 # =============================================================================
 # ЭНКОДЕР И ДЕКОДЕР
 # =============================================================================
+# Легкий L2-штраф удержит логарифмы мощностей от бесконечности
+reg = tf.keras.regularizers.l2(1e-4)
+
 encoder = tf.keras.Sequential([
     tf.keras.Input(shape=(int(input_dim),), dtype=tf.float32),
-    tf.keras.layers.Dense(128, activation="relu"),
-    tf.keras.layers.Dense(128, activation="relu"),
-    tf.keras.layers.Dense(128, activation="relu"),
-    tf.keras.layers.Dense(int(N_dim), activation="linear", name="z_powers")
+    
+    # Блок 1
+    tf.keras.layers.Dense(512, use_bias=False),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Activation("relu"),
+    tf.keras.layers.Dropout(0.2),
+    
+    # Блок 2
+    tf.keras.layers.Dense(512, use_bias=False),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Activation("relu"),
+    tf.keras.layers.Dropout(0.2),
+    
+    # Блок 3
+    tf.keras.layers.Dense(512, use_bias=False),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Activation("relu"),
+    tf.keras.layers.Dropout(0.1),
+    
+    # Латентное пространство (z_powers)
+    tf.keras.layers.Dense(
+        int(N_dim), 
+        activation="linear", 
+        use_bias=True, 
+        activity_regularizer=reg, 
+        name="z_powers"
+    )
 ])
 
 decoder = tf.keras.Sequential([
-    tf.keras.Input(shape=(int(N_dim),), dtype=tf.float32),
+    tf.keras.Input(shape=(int(N_dim),), dtype=tf.float32),    
+    tf.keras.layers.Dense(int(N_dim), activation="linear", name="latent_alignment"),
     SpatialPatternDecoder(
         M_channels=int(n_ch_white),
         N_patterns=int(N_patterns),
         name="spatial_decoder"
-    ),
-    tf.keras.layers.Flatten()
+    )
 ])
 
 from sklearn.model_selection import train_test_split
@@ -357,7 +701,7 @@ from sklearn.model_selection import train_test_split
 # =============================================================================
 # Индексы для сплита (откладываем 10% данных на валидацию)
 indices = np.arange(len(X_cov_flat))
-train_idx, val_idx = train_test_split(indices, test_size=0.1, random_state=42)
+train_idx, val_idx = train_test_split(indices, test_size=0.2, random_state=42)
 
 X_train = X_cov_flat[train_idx]
 X_val = X_cov_flat[val_idx]
@@ -370,16 +714,15 @@ print(f"Обучающая выборка: {len(X_train)} окон. Валида
 # =============================================================================
 # ПОДГОТОВКА ДАННЫХ И КОЛЛБЕКОВ
 # =============================================================================
-batch_size = 64
-n_neighbors = 40 
-loss_weight = 20.0
-umap_n_epochs = 20
+n_neighbors = 20 
+loss_weight = 1.0
 
 class HonestEarlyStoppingCallback(tf.keras.callbacks.Callback):
-    def __init__(self, X_train, X_val, patience=5):
+    def __init__(self, X_train, X_val, loss_weight, patience=5):
         super().__init__()
         self.X_train = X_train
         self.X_val = X_val
+        self.loss_weight = loss_weight  # Передаем вес реконструкции сюда
         self.patience = patience
         self.best_loss = np.inf
         self.wait = 0
@@ -395,29 +738,37 @@ class HonestEarlyStoppingCallback(tf.keras.callbacks.Callback):
             z = self.model.encoder(X_batch, training=False)
             X_recon = self.model.decoder(z, training=False)
             
-            # Считаем лосс для батча и умножаем на его размер для правильного усреднения
             batch_loss = riemannian_distance_loss(X_batch, X_recon).numpy()
+            # batch_loss = log_euclidean_loss(X_batch, X_recon).numpy()
+            # batch_loss = wasserstein_distance_loss(X_batch, X_recon).numpy()
+
             total_loss += batch_loss * len(X_batch)
             
         return total_loss / len(X_data)
 
     def on_epoch_end(self, epoch, logs=None):
-        # 1. Считаем честную ошибку для валидации
+        logs = logs or {}
+        
+        # 1. Считаем честную Риманову ошибку
         val_recon_loss = self._compute_honest_recon_loss(self.X_val)
         
-        # 2. Считаем честную ошибку для тренировки (берем случайные окна для скорости)
-        # Размер подвыборки делаем равным валидации, чтобы оценка была честной и быстрой
         idx = np.random.choice(len(self.X_train), len(self.X_val), replace=False)
         train_recon_loss = self._compute_honest_recon_loss(self.X_train[idx])
         
-        # 3. Записываем в логи Keras
-        if logs is not None:
-            logs['honest_train_loss'] = train_recon_loss
-            logs['honest_val_loss'] = val_recon_loss
-            
-        print(f" — Честный Recon Loss -> Train: {train_recon_loss:.4f} | Val: {val_recon_loss:.4f}")
+        # 2. Вычисляем чистый UMAP loss из общего лосса Keras
+        total_loss = logs.get('loss', 0.0)
+        approx_umap_loss = total_loss - (self.loss_weight * train_recon_loss)
         
-        # 4. Логика ранней остановки (ориентируемся только на Val Loss)
+        # 3. Сохраняем в логи для графиков
+        logs['honest_train_recon'] = train_recon_loss
+        logs['honest_val_recon'] = val_recon_loss
+        logs['umap_graph_loss'] = approx_umap_loss
+        
+        print(f"\n[Отчет {epoch+1}] Total Loss: {total_loss:.4f} | "
+              f"UMAP Loss: {approx_umap_loss:.4f} | "
+              f"Recon (Train: {train_recon_loss:.4f}, Val: {val_recon_loss:.4f})")
+        
+        # 4. Логика ранней остановки
         if val_recon_loss < self.best_loss:
             self.best_loss = val_recon_loss
             self.wait = 0
@@ -425,13 +776,13 @@ class HonestEarlyStoppingCallback(tf.keras.callbacks.Callback):
         else:
             self.wait += 1
             if self.wait >= self.patience:
-                print(f"\n[EarlyStopping] Остановка: честный val_loss не улучшается {self.patience} эпох.")
+                print(f"\n[EarlyStopping] Валидационный лосс реконструкции не улучшается {self.patience} шагов.")
                 self.model.stop_training = True
                 self.model.set_weights(self.best_weights)
-                print("[EarlyStopping] Лучшие веса восстановлены!")
 
+# При инициализации не забудь передать loss_weight
 keras_fit_args = {
-    "callbacks": [HonestEarlyStoppingCallback(X_train, X_val, patience=5)]
+    "callbacks": [HonestEarlyStoppingCallback(X_train, X_val, loss_weight=loss_weight, patience=15)]
 }
 
 # =============================================================================
@@ -444,8 +795,6 @@ embedder = ParametricUMAP(
     dims=(input_dim,),
     metric="precomputed", 
     n_neighbors=n_neighbors,
-    # n_epochs=umap_n_epochs, 
-    # batch_size=batch_size,
     parametric_reconstruction=True,
     autoencoder_loss=True, 
     parametric_reconstruction_loss_fcn=riemannian_distance_loss, 
@@ -455,34 +804,44 @@ embedder = ParametricUMAP(
     verbose=True
 )
 
-# embedder.loss_report_frequency = 1
-# embedder.n_training_epochs = 10      
+embedder.loss_report_frequency = 200
+embedder.n_training_epochs = 1      
 
 embedder.fit(X_train, precomputed_distances=dist_matrix_train)
 
 # %%
 # =============================================================================
-# ВИЗУАЛИЗАЦИЯ
+# ВИЗУАЛИЗАЦИЯ (ТОЛЬКО ВАЛИДНЫЕ ОШИБКИ)
 # =============================================================================
 import matplotlib.pyplot as plt
 
 history = embedder._history
 
-plt.figure(figsize=(10, 5))
+# Создаем фигуру с двумя подграфиками (для Recon и для UMAP)
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
 
-# Исходный общий лосс (UMAP + Recon)
-plt.plot(history['loss'], label='Total Train Loss (UMAP + Recon)', color='purple', linewidth=2, alpha=0.5, linestyle=':')
+# --- График 1: Честные ошибки реконструкции (Риманово расстояние) ---
+if 'honest_train_recon' in history and 'honest_val_recon' in history:
+    ax1.plot(history['honest_train_recon'], label='Honest Train Recon Loss', color='blue', linewidth=2)
+    ax1.plot(history['honest_val_recon'], label='Honest Val Recon Loss', color='green', linewidth=2)
+    
+ax1.set_title('Качество декодера: Ошибка ковариаций')
+ax1.set_xlabel('Шаги оценки')
+ax1.set_ylabel('Квадрат Риманова расстояния')
+ax1.legend()
+ax1.grid(True, linestyle='--', alpha=0.7)
 
-# Наши честные лоссы реконструкции
-if 'honest_train_loss' in history and 'honest_val_loss' in history:
-    plt.plot(history['honest_train_loss'], label='Honest Train Recon Loss', color='blue', linewidth=2)
-    plt.plot(history['honest_val_loss'], label='Honest Val Recon Loss', color='green', linewidth=2)
+# --- График 2: Истинный лосс графа UMAP ---
+if 'umap_graph_loss' in history:
+    ax2.plot(history['umap_graph_loss'], label='UMAP Graph Loss (Cross-Entropy)', color='purple', linewidth=2)
+    
+ax2.set_title('Качество проекции: Сходимость графа UMAP')
+ax2.set_xlabel('Шаги оценки')
+ax2.set_ylabel('Loss (Cross-Entropy)')
+ax2.legend()
+ax2.grid(True, linestyle='--', alpha=0.7)
 
-plt.title('Динамика обучения (Ошибки реконструкции матриц ковариации)')
-plt.xlabel('Эпохи (Keras)')
-plt.ylabel('Loss (Риманово расстояние)')
-plt.legend()
-plt.grid(True, linestyle='--', alpha=0.7)
+plt.tight_layout()
 plt.show()
 
 # %%
@@ -514,7 +873,7 @@ reducer_2d_nn = ParametricUMAP(
     encoder=encoder_2d,
     decoder=decoder_2d,
     n_components=2,
-    parametric_reconstruction=True, 
+    parametric_reconstruction=False, 
     parametric_reconstruction_loss_fcn=tf.keras.losses.MeanSquaredError(),
     # =========================
     verbose=True
@@ -529,7 +888,7 @@ print("Визуальное пространство обучено!")
 # 2. Визуализация
 plt.figure(figsize=(8, 6))
 plt.scatter(umap_coords[:, 0], umap_coords[:, 1], alpha=0.6, edgecolors='w', s=30)
-plt.title('Визуализация данных через PCA (2D)')
+plt.title('Визуализация данных')
 plt.xlabel('Главная компонента 1')
 plt.ylabel('Главная компонента 2')
 plt.grid(True, linestyle='--', alpha=0.5)
@@ -537,40 +896,80 @@ plt.show()
 
 # %%
 # =============================================================================
-# 6. ИЗВЛЕЧЕНИЕ ПАРАМЕТРОВ И ОТРИСОВКА
+# 6. ИЗВЛЕЧЕНИЕ ПАРАМЕТРОВ И ОТРИСОВКА (С АВТОСОРТИРОВКОЙ)
 # =============================================================================
 import matplotlib as mpl
+import numpy as np # На всякий случай убедимся, что np импортирован
 
-# 1. Извлекаем сырые значения z (логарифмы мощностей) 
-# Теперь выход энкодера — это и есть наше пространство источников!
-z_values = embedder.encoder.predict(X_cov_flat)   # Размерность: (n_windows, N_patterns)
+z_raw = embedder.encoder.predict(X_cov_flat)
+
+# 1. Прогоняем их через слои декодера ДО SpatialPatternDecoder, 
+# чтобы учесть выравнивание (latent_alignment) и получить корректные z для мощностей
+alignment_layer = embedder.decoder.get_layer("latent_alignment")
+z_aligned = alignment_layer(z_raw).numpy() 
 
 # 2. Переводим в реальные мощности
-powers = np.exp(z_values)
+powers = np.exp(z_aligned) 
 
 # 3. Извлекаем матрицу паттернов и нормируем 
 spatial_decoder_layer = embedder.decoder.get_layer("spatial_decoder")
-# Нулевой индекс весов — это матрица A. Первый индекс был бы шумом (noise_log).
 A_learned_raw = spatial_decoder_layer.get_weights()[0]
 A_global = A_learned_raw / np.linalg.norm(A_learned_raw, axis=0) 
 
-# ТЕПЕРЬ A_global - ЭТО И ЕСТЬ ГОТОВЫЕ ПАТТЕРНЫ В ПРОСТРАНСТВЕ СЕНСОРОВ!
+# =============================================================================
+# НОВОЕ: СОРТИРОВКА ПО ДИСПЕРСИИ МОЩНОСТИ (ПО УБЫВАНИЮ)
+# =============================================================================
+# Считаем дисперсию (разброс) каждого из N_patterns вдоль всех эпох (axis=0)
+power_variances = np.var(powers, axis=0)
+
+# Получаем индексы сортировки по убыванию [::-1]
+sort_idx = np.argsort(power_variances)[::-1]
+
+# Сортируем массив мощностей и столбцы матрицы прямой модели A_global
+powers = powers[:, sort_idx]
+A_global = A_global[:, sort_idx]
+
+print(f"Топ-5 компонент по дисперсии мощности (оригинальные индексы): {sort_idx[:5]}")
+# =============================================================================
+
+# 4. ТЕПЕРЬ A_global - ЭТО ОТСОРТИРОВАННЫЕ ПАТТЕРНЫ В ПРОСТРАНСТВЕ СЕНСОРОВ!
 found_patterns = [A_global[:, i] for i in range(N_patterns)]
 
-# 4. Фильтры Хауфе (с Тихоновской регуляризацией)
+# 5. Фильтры Хауфе (с Тихоновской регуляризацией)
 C_global_mean = np.mean(covmats, axis=0)
 
-# Коэффициент регуляризации (обычно 1e-4 или 1e-5 отлично работают для ЭЭГ)
+# Коэффициент регуляризации 
 alpha = 1e-4  
 
 # Добавляем единичную матрицу, масштабированную на след C_global_mean
 I = np.eye(C_global_mean.shape[0])
 C_global_reg = C_global_mean + alpha * np.trace(C_global_mean) * I
 
-# Обращаем регуляризованную матрицу (теперь можно безопасно использовать обычный inv)
+# Обращаем регуляризованную матрицу
 C_global_inv = np.linalg.inv(C_global_reg)
 
+# Фильтры тоже автоматически получаются отсортированными, так как мы берем столбцы из отсортированной A_global
 found_filters = [C_global_inv @ A_global[:, i] for i in range(N_patterns)]
+
+# %%
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Пример создания матрицы (100 точек, у каждой по 3 координаты)
+# powers = np.random.rand(100, 3) 
+
+fig = plt.figure()
+ax = fig.add_subplot(projection='3d')
+
+# Передаем столбцы 0, 1 и 2 в качестве координат X, Y, Z
+ax.scatter(powers[:, 5], powers[:, 3], powers[:, 7], c='blue', marker='o')
+
+ax.set_xlabel('Ось X')
+ax.set_ylabel('Ось Y')
+ax.set_xlabel('Ось Z')
+
+plt.show()
+
 
 # %%
 import numpy as np
@@ -623,7 +1022,7 @@ def format_umap_axes(ax):
     ax.grid(True, linestyle='--', alpha=0.5, zorder=0)
 
 print("Toha, the best coder in the world")  # AI slope  
-# Выбираем индекс паттерна (0..N_patterns-1)
+# Выбираем индекс паттерна (0..N_patterns-1
 comp_idx = 0
 W_sensor = found_filters[comp_idx]
 A_pattern = found_patterns[comp_idx]
@@ -632,7 +1031,7 @@ A_pattern = found_patterns[comp_idx]
 p_vals = powers[:, comp_idx]
 
 # 2. Мощность через пространственный фильтр (w^T * C * w)
-filtered_powers = np.array([W_sensor.T @ C @ W_sensor for C in covmats])
+filtered_powers = np.array([W_sensor.T @ C @ W_sensor for C in covmats_reg])
 
 # 3. Нормализация (делим на std, без вычета среднего)
 p_vals_norm = p_vals / np.std(p_vals)
@@ -693,7 +1092,7 @@ ax_env.plot(window_idx, p_vals_norm, color='black', lw=1.2, label='Выучен�
 xtick_positions = []
 xtick_labels = []
 for lab in unique_labels_ordered:
-    mask = (labels == lab)
+    mask = (window_labels == lab)
     if not np.any(mask):
         continue
     changes = np.diff(np.concatenate(([0], mask.astype(int), [0])))
@@ -1060,16 +1459,16 @@ def update_dashboard(event):
         verbose=0
     )[0]
     
-    p_vals = z_20d
+    p_vals = np.exp(z_20d)
 
-    print(
-        "z_20d:",
-        "min =", np.min(z_20d),
-        "max =", np.max(z_20d),
-        "mean =", np.mean(z_20d),
-        "std =", np.std(z_20d),
-        "finite =", np.all(np.isfinite(z_20d))
-    )
+    # print(
+    #     "z_20d:",
+    #     "min =", np.min(z_20d),
+    #     "max =", np.max(z_20d),
+    #     "mean =", np.mean(z_20d),
+    #     "std =", np.std(z_20d),
+    #     "finite =", np.all(np.isfinite(z_20d))
+    # )
 
     p_top = p_vals[top_indices]
 
@@ -1140,7 +1539,7 @@ def update_dashboard(event):
             f"Мощн: {power:.2f}"
         )
 
-        if norm_p > 0.4:
+        if norm_p > 0.1:
             titles[i].set_color('black')
             titles[i].set_fontweight('bold')
         else:
