@@ -145,7 +145,7 @@ class ParametricUMAP(UMAP):
                         )
                     )
                 )
-
+    
     def fit(self, X, y=None, precomputed_distances=None, landmark_positions=None):
         """Fit X into an embedded space.
 
@@ -1161,6 +1161,19 @@ class UMAPModel(keras.Model):
         else:
             self.landmark_loss_fn = landmark_loss_fn
 
+        # ================================================
+        self.umap_loss_tracker = keras.metrics.Mean(name="umap_loss")
+        self.recon_loss_tracker = keras.metrics.Mean(name="recon_loss")
+        # ================================================
+
+    # ================================================
+    @property
+    def metrics(self):
+        m = super().metrics
+        m.extend([self.umap_loss_tracker, self.recon_loss_tracker])
+        return m
+    # ================================================
+
     def call(self, inputs):
         to_x, from_x = inputs
         embedding_to = self.encoder(to_x)
@@ -1180,29 +1193,65 @@ class UMAPModel(keras.Model):
             y_pred["reconstruction"] = embedding_to_recon
         return y_pred
 
+    # def compute_loss(self, x=None, y=None, y_pred=None, sample_weight=None, **kwargs):
+    #     losses = []
+    #     # Regularization losses.
+    #     for loss in self.losses:
+    #         losses.append(ops.cast(loss, dtype=keras.backend.floatx()))
+
+    #     # umap loss
+    #     losses.append(self._umap_loss(y_pred))
+
+    #     # global correlation loss
+    #     if self.global_correlation_loss_weight > 0:
+    #         losses.append(self._global_correlation_loss(y, y_pred))
+
+    #     # parametric reconstruction loss
+    #     if self.parametric_reconstruction:
+    #         losses.append(self._parametric_reconstruction_loss(y, y_pred))
+
+    #     # landmark loss, present if landmarks are provided in fit() or fit_transform()
+    #     if "landmark_to" in y:
+    #         losses.append(self._landmark_loss(y, y_pred))
+
+    #     return ops.sum(losses)
+
     def compute_loss(self, x=None, y=None, y_pred=None, sample_weight=None, **kwargs):
         losses = []
         # Regularization losses.
         for loss in self.losses:
             losses.append(ops.cast(loss, dtype=keras.backend.floatx()))
 
-        # umap loss
-        losses.append(self._umap_loss(y_pred))
-
+        # umap loss (вычисляем и трекаем ТОЛЬКО при обучении)
+        if kwargs.get('training', False) or (not hasattr(keras.backend, 'in_train_phase')):
+             # Мы можем определить, идет ли обучение, проверив наличие ключа 'umap' в y
+             # На валидации y содержит только ключ 'reconstruction'
+             pass
+             
+        # Более надежный способ для Keras 3 - проверить наличие ключа 'umap' в словаре y.
+        # В функции construct_edge_dataset ключ 'umap' добавляется всегда: outputs = {"umap": ops.repeat(0, batch_size)}
+        # А вот на валидации (строка 432) мы передаем только {"reconstruction": self.reconstruction_validation}
+        if y is not None and "umap" in y:
+            umap_loss_val = self._umap_loss(y_pred)
+            losses.append(umap_loss_val)
+            self.umap_loss_tracker.update_state(umap_loss_val)  # Обновляем трекер UMAP
+        
         # global correlation loss
-        if self.global_correlation_loss_weight > 0:
+        if self.global_correlation_loss_weight > 0 and y is not None and "global_correlation" in y:
             losses.append(self._global_correlation_loss(y, y_pred))
 
         # parametric reconstruction loss
-        if self.parametric_reconstruction:
-            losses.append(self._parametric_reconstruction_loss(y, y_pred))
+        if self.parametric_reconstruction and y is not None and "reconstruction" in y:
+            recon_loss_val = self._parametric_reconstruction_loss(y, y_pred)
+            losses.append(recon_loss_val)
+            self.recon_loss_tracker.update_state(recon_loss_val)  # Обновляем трекер реконструкции
 
-        # landmark loss, present if landmarks are provided in fit() or fit_transform()
-        if "landmark_to" in y:
+        # landmark loss
+        if y is not None and "landmark_to" in y:
             losses.append(self._landmark_loss(y, y_pred))
 
         return ops.sum(losses)
-
+    
     def _umap_loss(self, y_pred, repulsion_strength=1.0):
         # split out to/from
         embedding_to = y_pred["embedding_to"]

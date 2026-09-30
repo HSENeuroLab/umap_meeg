@@ -4,21 +4,17 @@ Created on Wed Oct 22 17:07:11 2025
 
 @author: anton
 """
-import tensorflow as tf
-
 import os
-
+import sys
 import mne
 import numpy as np
+import tensorflow as tf
 import matplotlib.pyplot as plt
 import umap
 
 from scipy.signal import butter, filtfilt
 from scipy.linalg import eigh
 from scipy.linalg import inv, null_space
-
-import sys
-import tensorflow as tf
 from umap.parametric_umap import ParametricUMAP
 
 lib_directory = os.path.abspath("C:/Users/ansbel/Documents/GitHub/pyRiemann") 
@@ -32,21 +28,14 @@ from pyriemann.geometry.distance import pairwise_distance
 # =============================================================================
 # 1. ЗАГРУЗКА И ПРЕДОБРАБОТКА ДАННЫХ
 # =============================================================================
-fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part2/eeg/TumAle_raw.fif"
-# fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part2/eeg/DmiAna_raw.fif"
-# fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part1/eeg/10_07_g1_2223_raw.fif"
+fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part1/eeg/10_07_g1_2223_raw.fif"
 raw = mne.io.read_raw_fif(fpath, preload=True)
 sfreq = raw.info['sfreq']
 
 new_descriptions = [
-    # 'RS_EC_1', 'RS_EO_1', '2Hz', '05Hz', '4Hz', '1Hz', '3Hz',
-    # 'NoRy_1', 'Waltz_1', 'Waltz_2', 'NoRy_2', 'NoRy_3', 'Waltz_3',
-    # 'NoRy_4', 'Waltz_4', 'NoRy_5', 'Waltz_5', 'RS_EC_2', 'RS_EO_2',
-    # 'Waltz_6', 'Waltz_7', 'Waltz_8'
     'RS_EC_1', 'RS_EO_1', '2Hz', '05Hz', '4Hz', '1Hz', '3Hz',
     'NoRy_1', 'Waltz_1', 'Waltz_2', 'NoRy_2', 'NoRy_3', 'Waltz_3',
     'NoRy_4', 'Waltz_4', 'NoRy_5', 'Waltz_5', 'RS_EC_2', 'RS_EO_2',
-    'Waltz_6', 'Waltz_7', 'Waltz_8'
 ]
 
 descriptions = raw.annotations.description
@@ -59,7 +48,7 @@ for idx, label in zip(significant_indices, new_descriptions):
 
 old_annot = raw.annotations
 new_durations = np.array(old_annot.duration, copy=True)
-new_durations[significant_indices] = 120
+new_durations[significant_indices] = 110
 
 new_annot = mne.Annotations(
     onset=old_annot.onset,
@@ -69,72 +58,98 @@ new_annot = mne.Annotations(
 )
 raw.set_annotations(new_annot)
 
+# Для вырезания возьмем сразу только ЭЭГ каналы
 raw_clean = raw.copy().pick_types(eeg=True)
-data = raw.get_data()
 
 # %%
-import mne
-import numpy as np
+# =============================================================================
+# 2. УМНОЕ ВЫРЕЗАНИЕ (Оставляем нужные, переносим внутренние BAD, удаляем RS_EC_1/2)
+# =============================================================================
 
-# ... ваш код с загрузкой и установкой новых аннотаций ...
-
-# Список аннотаций, которые нужно вырезать
+# Указываем, какие метки мы хотим ВЫКИНУТЬ из списка
 exclude_labels = ['RS_EC_1', 'RS_EC_2']
+# Формируем итоговый список того, что будем вырезать и склеивать
+target_labels = [desc for desc in new_descriptions if desc not in exclude_labels]
 
-# Ищем временные интервалы, которые нужно ОСТАВИТЬ
-keep_segments = []
+data_chunks = []
+final_onsets = []
+final_durations = []
+final_descriptions = []
+
 current_time = 0.0
-max_time = raw_clean.times[-1]
 
+# Идем по всем аннотациям и ищем только наши целевые куски
 for annot in raw_clean.annotations:
-    if annot['description'] in exclude_labels:
-        start_remove = annot['onset'] - raw_clean.first_time
-        end_remove = start_remove + annot['duration']
+    desc = annot['description']
+    
+    if desc in target_labels:
+        onset = annot['onset']
+        duration = annot['duration']
         
-        # Если между current_time и началом удаляемого куска есть данные, сохраняем интервал
-        if current_time < start_remove:
-            keep_segments.append((current_time, start_remove))
+        # Индексы для вырезания данных
+        start_idx = raw_clean.time_as_index(onset)[0]
+        end_idx = min(raw_clean.time_as_index(onset + duration)[0], raw_clean.n_times)
+        
+        if start_idx >= end_idx:
+            continue
             
-        # Сдвигаем текущее время (курсор) на конец удаленного куска
-        current_time = end_remove
+        # 1) Вырезаем данные куска
+        chunk = raw_clean.get_data(start=start_idx, stop=end_idx)
+        actual_duration = chunk.shape[1] / sfreq
+        data_chunks.append(chunk)
+        
+        # 2) Записываем саму целевую аннотацию (например, 'Waltz_1')
+        final_onsets.append(current_time)
+        final_durations.append(actual_duration)
+        final_descriptions.append(desc)
+        
+        # 3) Ищем BAD-аннотации, которые находятся ВНУТРИ этого куска
+        for bad_annot in raw_clean.annotations:
+            bad_desc = bad_annot['description']
+            if 'BAD' in bad_desc:
+                bad_onset = bad_annot['onset']
+                bad_duration = bad_annot['duration']
+                
+                # Находим пересечение целевого куска и BAD-аннотации
+                overlap_start = max(onset, bad_onset)
+                overlap_end = min(onset + duration, bad_onset + bad_duration)
+                
+                # Если пересечение есть, значит BAD относится к нашему куску
+                if overlap_start < overlap_end:
+                    # Смещаем время начала BAD относительно начала нашего куска
+                    rel_onset = overlap_start - onset 
+                    overlap_dur = overlap_end - overlap_start
+                    
+                    final_onsets.append(current_time + rel_onset)
+                    final_durations.append(overlap_dur)
+                    final_descriptions.append(bad_desc)
+        
+        # Сдвигаем время для следующего куска (оно прибавится к current_time)
+        current_time += actual_duration
 
-# Не забываем добавить последний кусок от конца последней удаленной разметки до конца записи
-if current_time < max_time:
-    keep_segments.append((current_time, max_time))
+# =============================================================================
+# 3. СБОРКА НОВОГО ОБЪЕКТА RAW
+# =============================================================================
 
-# Нарезаем raw на куски, которые нужно оставить
-raws_to_concat = []
-for tmin, tmax in keep_segments:
-    # Обязательно делаем copy(), так как crop работает in-place (изменяет исходный объект)
-    raw_chunk = raw_clean.copy().crop(tmin=tmin, tmax=tmax)
-    raws_to_concat.append(raw_chunk)
+# Сшиваем все куски данных
+new_data = np.concatenate(data_chunks, axis=1)
 
-# Склеиваем куски обратно в единый непрерывный объект
-# Обратите внимание: функция изменяет первый элемент списка in-place, добавляя к нему остальные
-raw_stitched = mne.concatenate_raws(raws_to_concat)
+# Создаем новый объект Raw
+info = raw_clean.info.copy()
+final_raw = mne.io.RawArray(new_data, info)
 
-# Теперь вы можете получить сплошной массив данных без RS_EC_1 и 2
-data_stitched = raw_stitched.get_data()
+# Вешаем собранные аннотации (основные + BAD, которые были внутри)
+final_annotations = mne.Annotations(
+    onset=final_onsets,
+    duration=final_durations,
+    description=final_descriptions
+)
+final_raw.set_annotations(final_annotations)
 
-# Проверка: смотрим, какие аннотации остались
-print(np.unique(raw_stitched.annotations.description))
+print("\n--- Итоговые аннотации нового объекта ---")
+print(final_raw.annotations)
 
-# %%
-raw_stitched.annotations.delete([16,17])
-
-# %%
-raw = mne.io.RawArray(raw_stitched.get_data(),raw_stitched.info)
-raw.set_annotations(raw_stitched.annotations)
-
-# %%
-raw = raw_stitched.copy()
-new_descriptions = [
-    'RS_EO_1', '2Hz', '05Hz', '4Hz', '1Hz', '3Hz',
-    'NoRy_1', 'Waltz_1', 'Waltz_2', 'NoRy_2', 'NoRy_3', 'Waltz_3',
-    'NoRy_4', 'Waltz_4', 'NoRy_5', 'Waltz_5', 'RS_EO_2',
-    'Waltz_6', 'Waltz_7', 'Waltz_8'
-]
-
+raw = final_raw.copy()
 
 # %%
 from mne.preprocessing import ICA
@@ -146,6 +161,9 @@ ica.fit(raw)
 # 4. Визуализация компонент (для ручного поиска артефактов глаз/сердца)
 ica.plot_components()  # Карты топографии компонент
 ica.plot_sources(raw)  # Временные ряды компонент
+
+# %%
+data = raw.get_data()
 
 # %%
 # =============================================================================
@@ -213,8 +231,8 @@ n_components_ssd = W_ssd.shape[1]
 # =============================================================================
 # 3. НАРЕЗКА НА ЭПОХИ
 # =============================================================================
-Wsize = 2
-Ssize = 0.5
+Wsize = 1
+Ssize = 0.5 
 overlap = Wsize - Ssize
 
 X_windows_band = []
@@ -489,7 +507,7 @@ covmats_psd = np.einsum(
     eigvecs
 )
 
-dist_matrix_init = compute_super_fast_wasserstein(covmats_psd, eps=0)
+dist_matrix_init = compute_super_fast_wasserstein(covmats, eps=0)
 
 # %%
 import matplotlib.pyplot as plt
@@ -529,14 +547,136 @@ plt.title("Матрица расстояний с повышенным конт�
 plt.show()
 
 # %%
+from pyriemann.utils.base import invsqrtm
+
+# Средняя ковариационная матрица (по всем окнам)
+C_avg = np.mean(covmats_reg, axis=0)
+
+# Корень из обратной средней матрицы
+C_avg_invsqrt = invsqrtm(C_avg)
+
+# Отбеливание всех матриц: C_w = C_avg^{-1/2} * C * C_avg^{-1/2}
+covmats_w = C_avg_invsqrt @ covmats_reg @ C_avg_invsqrt
+
+# %%
+import numpy as np
+from scipy.linalg import sqrtm
+
+# Собственные векторы C_avg (отсортированы по убыванию собственных значений)
+eigvals, eigvecs = np.linalg.eigh(C_avg)
+idx = np.argsort(eigvals)[::-1]
+eigvals = eigvals[idx]
+eigvecs = eigvecs[:, idx]
+
+k = 38 
+fig, axes = plt.subplots(1, k, figsize=(3*k, 6))
+
+for i in range(k):
+    # Верхний ряд: собственный вектор
+    mne.viz.plot_topomap(eigvecs[:, i], raw.info, axes=axes[i], show=False)
+    axes[i].set_title(f"Собств. вект. {i+1}")
+    
+plt.tight_layout()
+plt.show()
+
+# %%
+import tensorflow as tf
 import numpy as np
 
-n_ch_white = covmats_reg.shape[1]
+class BiMapLayer(tf.keras.layers.Layer):
+    """
+    Слой билинейного отображения: W * X * W^T
+    Выполняет пространственную фильтрацию сенсоров.
+    """
+    def __init__(self, units, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+
+    def build(self, input_shape):
+        M_in = int(input_shape[-1])
+        # Инициализируем матрицу W как единичную, чтобы сеть начинала обучение 
+        # с "прозрачного" пропускания сигнала, постепенно его фильтруя
+        self.W = self.add_weight(
+            shape=(self.units, M_in),
+            initializer=tf.keras.initializers.Identity(),
+            trainable=True,
+            name="W_bimap"
+        )
+
+    def call(self, inputs):
+        # Штрафуем отклонение W * W^T от единичной матрицы
+        I = tf.eye(self.units, dtype=self.W.dtype)
+        ortho_loss = tf.reduce_mean(tf.square(tf.matmul(self.W, self.W, transpose_b=True) - I))
+        self.add_loss(1e-3 * ortho_loss)
+        
+        return tf.einsum('um,bmn,vn->buv', self.W, inputs, self.W)
+    
+class ReLogEigAndFlattenLayer(tf.keras.layers.Layer):
+    """
+    Оптимизированный слой: объединяет ReEig (отсечение мелких собственных значений) 
+    и LogEig (логарифм матрицы) с последующей векторизацией.
+    Выполняет дорогостоящее разложение eigh только один раз.
+    """
+    def __init__(self, epsilon=1e-4, jitter=1e-6, **kwargs):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+        self.jitter = jitter  # Микрошум для стабильности градиентов
+
+    def build(self, input_shape):
+        self.M = int(input_shape[-1])
+        
+        # Подготавливаем индексы и множители для векторизации 1 раз при сборке
+        idx_i, idx_j = np.triu_indices(self.M)
+        self.flat_indices = tf.constant(idx_i * self.M + idx_j, dtype=tf.int32)
+        
+        # Умножаем внедиагональные элементы на sqrt(2) для сохранения изометрии
+        mults = np.where(idx_i == idx_j, 1.0, np.sqrt(2.0)).astype(np.float32)
+        self.multipliers = tf.constant(mults, dtype=tf.float32)
+
+    def call(self, inputs):
+        # 1. Принудительная симметризация
+        X = 0.5 * (inputs + tf.transpose(inputs, perm=[0, 2, 1]))
+        
+        # 2. Добавляем микрошум на диагональ для спасения от NaN при равных eigs
+        if self.jitter > 0:
+            X = X + tf.eye(self.M, dtype=X.dtype) * self.jitter
+            
+        # 3. ЕДИНСТВЕННОЕ разложение
+        eigvals, eigvecs = tf.linalg.eigh(X)
+        
+        # 4. Одновременно делаем ReEig (ограничение снизу) и Log (проекция)
+        safe_eigvals = tf.maximum(eigvals, self.epsilon)
+        log_eigvals = tf.math.log(safe_eigvals)
+        
+        # 5. Собираем логарифмированную матрицу в касательном пространстве
+        log_X = tf.einsum('bij,bj,bkj->bik', eigvecs, log_eigvals, eigvecs)
+        
+        # 6. Векторизация (извлекаем верхний треугольник)
+        log_X_flat = tf.reshape(log_X, [-1, self.M * self.M])
+        vecs = tf.gather(log_X_flat, self.flat_indices, axis=1)
+        
+        # 7. Применяем множители
+        return vecs * self.multipliers
+
+# %%
+import numpy as np
+
+def init_identity_with_noise(shape, dtype=None):
+    M, N = shape
+    init = np.zeros((M, N), dtype=np.float32)
+    # Первые M столбцов — единичные
+    for i in range(min(M, N)):
+        init[i, i] = 1.0
+    # Остальные — случайные малые, чтобы после нормализации не были нулевыми
+    if N > M:
+        init[:, M:] = np.random.normal(0, 0.1, (M, N - M)).astype(np.float32)
+    return tf.constant(init, dtype=dtype)
+n_ch_white = covmats_w.shape[1]
 
 # =============================================================================
 # ПОДГОТОВКА ДАННЫХ (УНИКАЛЬНЫЕ ЭЛЕМЕНТЫ)
 # =============================================================================
-M_channels = covmats_reg.shape[1]
+M_channels = covmats_w.shape[1]
 
 # Индексы верхней треугольной матрицы
 idx_i, idx_j = np.triu_indices(M_channels)
@@ -545,7 +685,7 @@ idx_i, idx_j = np.triu_indices(M_channels)
 multipliers = np.where(idx_i == idx_j, 1.0, np.sqrt(2.0)).astype(np.float32)
 
 # Вытаскиваем уникальные элементы и сразу масштабируем
-X_cov_flat = (covmats_reg[:, idx_i, idx_j] * multipliers).astype(np.float32)
+X_cov_flat = (covmats_w[:, idx_i, idx_j] * multipliers).astype(np.float32)
 
 input_dim = int(X_cov_flat.shape[1]) # Теперь размерность M*(M+1)/2
 print(f"Новая размерность входа: {input_dim}")
@@ -555,44 +695,51 @@ class SpatialPatternDecoder(tf.keras.layers.Layer):
         super().__init__(**kwargs)
         self.M_channels = int(M_channels)
         self.N_patterns = int(N_patterns)
-        
+        self.dropout = tf.keras.layers.Dropout(0.2)
+
     def build(self, input_shape):
         self.A = self.add_weight(
             shape=(self.M_channels, self.N_patterns),
-            initializer=tf.keras.initializers.RandomNormal(stddev=0.1),
+            initializer=init_identity_with_noise,
             trainable=True,
             name="A_patterns"
         )
-        
-        self.noise_log = self.add_weight(
-            shape=(self.M_channels,),
-            initializer=tf.keras.initializers.Constant(-3.0),
-            trainable=True,
-            name="sensor_noise"
-        )
-        
-        # Подготовка констант для векторизации
+                
         i, j = np.triu_indices(self.M_channels)
         self.flat_indices = tf.constant(i * self.M_channels + j, dtype=tf.int32)
         self.multipliers = tf.constant(np.where(i == j, 1.0, np.sqrt(2.0)), dtype=tf.float32)
-
-    def call(self, z):
+    
+        # self.noise_log = self.add_weight(
+        #     shape=(self.M_channels,),
+        #     initializer=tf.keras.initializers.Constant(-4.0),
+        #     trainable=True,
+        #     name="sensor_noise"
+        # )
+                        
+    def call(self, z, training=None): 
         A_norm = tf.math.l2_normalize(self.A, axis=0)
-        P = tf.exp(z)
         
-        C_signal = tf.einsum("mf,bf,lf->bml", A_norm, P, A_norm)
-        noise_variance = tf.math.softplus(self.noise_log)
-        noise_diag = tf.linalg.diag(noise_variance)
+        # Ограничиваем лог-мощность физиологически адекватными рамками
+        z_safe = tf.clip_by_value(z, clip_value_min=-15.0, clip_value_max=10.0)
+        P_raw = tf.exp(z_safe)
         
-        # Полная матрица (batch, M, M)
-        C_recon = C_signal + noise_diag
+        # Применяем Dropout: на обучении случайно зануляет 20% источников
+        P_drop = self.dropout(P_raw, training=training)
         
-        # Выборка уникальных элементов и масштабирование
+        # Штраф берем от сырой мощности (до дропаута) для стабильности градиентов
+        self.add_loss(1e-2 * tf.reduce_mean(P_raw)) 
+        
+        # --- СБОРКА СИГНАЛА (НЕЗАВИСИМЫЕ ИСТОЧНИКИ) ---
+        C_signal = tf.einsum("mf,bf,lf->bml", A_norm, P_drop, A_norm)
+        
+        # Полная прямая модель (без искусственного шума)
+        C_recon = C_signal
+        
         C_recon_flat = tf.reshape(C_recon, [-1, self.M_channels * self.M_channels])
         vecs = tf.gather(C_recon_flat, self.flat_indices, axis=1)
         
-        return vecs * self.multipliers # Выход: (batch, M*(M+1)/2)
-
+        return vecs * self.multipliers
+            
 def build_unvec_matrix(M):
     """Создает матрицу для быстрого преобразования вектора обратно в симметричную матрицу"""
     D = M * (M + 1) // 2
@@ -647,7 +794,6 @@ def riemannian_distance_loss(y_true_flat, y_pred_flat):
     log_eigvals_mid = tf.math.log(tf.maximum(eigvals_mid, eps))
 
     # Шаг 4: Считаем дистанцию напрямую по собственным значениям    
-    # dist_sq = tf.reduce_sum(tf.square(log_eigvals_mid), axis=1) / tf.cast(M * M, tf.float32)
     dist_sq = tf.sqrt(tf.reduce_sum(tf.square(log_eigvals_mid), axis=1))
 
     return tf.reduce_mean(dist_sq)
@@ -686,7 +832,15 @@ def wasserstein_distance_loss(y_true_flat, y_pred_flat):
     C_true = reconstruct_sym_matrix(y_true_flat, M)
     C_pred = reconstruct_sym_matrix(y_pred_flat, M)
     
-    eps = 0 
+    # Симметризация на всякий случай
+    C_true = 0.5 * (C_true + tf.transpose(C_true, perm=[0, 2, 1]))
+    C_pred = 0.5 * (C_pred + tf.transpose(C_pred, perm=[0, 2, 1]))
+    
+    # 0. Явно отсекаем вычисление градиентов для целевых данных
+    C_true = tf.stop_gradient(C_true)
+    
+    # КРИТИЧНО: Машинный эпсилон для защиты от бесконечных градиентов в tf.sqrt
+    eps = 1e-6 
 
     # 1. Вычисляем следы исходных матриц
     tr_true = tf.linalg.trace(C_true)
@@ -705,67 +859,126 @@ def wasserstein_distance_loss(y_true_flat, y_pred_flat):
     eigvals_mid, _ = tf.linalg.eigh(C_mid) 
     tr_mid_sqrt = tf.reduce_sum(tf.sqrt(tf.maximum(eigvals_mid, eps)), axis=1)
 
-    # 5. Итоговое расстояние Вассерштейна
+    # 5. Квадрат расстояния Вассерштейна
     d2 = tr_true + tr_pred - 2.0 * tr_mid_sqrt
     
-    # Защита от отрицательных значений из-за погрешности float32
-    d2 = tf.maximum(d2, 0.0)
+    # Защита от отрицательных значений (погрешности float32) и строгих нулей
+    d2 = tf.maximum(d2, eps)
     
-    # Усредняем и масштабируем (делим на M для совместимости градиентов)
-    return tf.reduce_mean(d2 / tf.cast(M, tf.float32))
+    # 6. Настоящая дистанция Вассерштейна (с корнем)
+    dist = tf.sqrt(d2)
+    
+    # Усредняем по батчу без искажения масштаба самой метрики
+    return tf.reduce_mean(dist)
 
 # =============================================================================
 # ПОДГОТОВКА ДАННЫХ
 # =============================================================================
-N_patterns = int(60)
+N_patterns = int(45)
 N_dim = int(N_patterns)
 
 print(f"Обучение ParametricUMAP: N_dim={N_dim}, N_patterns={N_patterns}")
+
 
 # =============================================================================
 # ЭНКОДЕР И ДЕКОДЕР
 # =============================================================================
 
+# encoder = tf.keras.Sequential([
+#     tf.keras.Input(shape=(int(input_dim),), dtype=tf.float32),
+    
+#     # Блок 1
+#     tf.keras.layers.Dense(512, use_bias=False),
+#     tf.keras.layers.LayerNormalization(epsilon=1e-6),
+#     tf.keras.layers.Activation("elu"),
+#     tf.keras.layers.Dropout(0.2),
+    
+#     # Блок 2
+#     tf.keras.layers.Dense(512, use_bias=False),
+#     tf.keras.layers.LayerNormalization(epsilon=1e-6),
+#     tf.keras.layers.Activation("elu"),
+#     tf.keras.layers.Dropout(0.2),
+    
+#     # Блок 3
+#     tf.keras.layers.Dense(512, use_bias=False),
+#     tf.keras.layers.LayerNormalization(epsilon=1e-6),
+#     tf.keras.layers.Activation("elu"),
+#     tf.keras.layers.Dropout(0.1),
+    
+#     tf.keras.layers.Dense(
+#         int(N_dim), 
+#         activation="linear", 
+#         use_bias=True, 
+#         name="latent_alignment"
+#     ),
+    
+#     # tf.keras.layers.Activation("softplus", name="z_amplitudes")
+# ])
+
+# decoder = tf.keras.Sequential([
+#     tf.keras.Input(shape=(int(N_dim),), dtype=tf.float32),    
+    
+#     SpatialPatternDecoder(
+#         M_channels=int(n_ch_white),
+#         N_patterns=int(N_patterns),
+#         name="spatial_decoder"
+#     )
+# ])
+
+class UnflattenSymmetricLayer(tf.keras.layers.Layer):
+    """Превращает плоские векторы обратно в матрицы прямо внутри нейросети"""
+    def __init__(self, M, **kwargs):
+        super().__init__(**kwargs)
+        self.M = M
+
+    def call(self, inputs):
+        # Используем твою функцию reconstruct_sym_matrix
+        return reconstruct_sym_matrix(inputs, self.M)
+    
+M_channels = int(n_ch_white)
+
 encoder = tf.keras.Sequential([
     tf.keras.Input(shape=(int(input_dim),), dtype=tf.float32),
+    UnflattenSymmetricLayer(M=M_channels, name="unflatten_to_sym"),
     
-    # Блок 1
+    # --- СТАДИЯ 1: SPDNet (Оптимизированная) ---
+    BiMapLayer(units=M_channels, name="spd_bimap"),
+    ReLogEigAndFlattenLayer(epsilon=1e-4, jitter=1e-6, name="spd_relog_flatten"),
+    
+    # --- СТАДИЯ 2: Многослойный Перцептрон (Распаковка N > M) ---
     tf.keras.layers.Dense(512, use_bias=False),
-    tf.keras.layers.BatchNormalization(),
-    tf.keras.layers.Activation("relu"),
+    tf.keras.layers.LayerNormalization(epsilon=1e-6),
+    tf.keras.layers.Activation("elu"),
     tf.keras.layers.Dropout(0.2),
     
-    # Блок 2
     tf.keras.layers.Dense(512, use_bias=False),
-    tf.keras.layers.BatchNormalization(),
-    tf.keras.layers.Activation("relu"),
+    tf.keras.layers.LayerNormalization(epsilon=1e-6),
+    tf.keras.layers.Activation("elu"),
     tf.keras.layers.Dropout(0.2),
     
-    # Блок 3
     tf.keras.layers.Dense(512, use_bias=False),
-    tf.keras.layers.BatchNormalization(),
-    tf.keras.layers.Activation("relu"),
+    tf.keras.layers.LayerNormalization(epsilon=1e-6),
+    tf.keras.layers.Activation("elu"),
     tf.keras.layers.Dropout(0.1),
     
-    # Латентное пространство (z_powers)
     tf.keras.layers.Dense(
-        int(N_dim), 
+        int(N_patterns), 
         activation="linear", 
         use_bias=True, 
-        name="z_powers"
+        name="latent_alignment"
     )
 ])
 
+# Декодер ОСТАЕТСЯ БЕЗ ИЗМЕНЕНИЙ, он уже идеален
 decoder = tf.keras.Sequential([
     tf.keras.Input(shape=(int(N_dim),), dtype=tf.float32),    
-    tf.keras.layers.Dense(int(N_dim), activation="linear", name="latent_alignment"),
+    
     SpatialPatternDecoder(
-        M_channels=int(n_ch_white),
+        M_channels=M_channels,
         N_patterns=int(N_patterns),
         name="spatial_decoder"
     )
 ])
-
 from sklearn.model_selection import train_test_split
 
 # =============================================================================
@@ -876,7 +1089,7 @@ embedder = ParametricUMAP(
     verbose=True
 )
 
-embedder.loss_report_frequency = 200
+embedder.loss_report_frequency = 100
 embedder.n_training_epochs = 1      
 
 embedder.fit(X_train, precomputed_distances=dist_matrix_train)
@@ -971,25 +1184,22 @@ plt.show()
 # 6. ИЗВЛЕЧЕНИЕ ПАРАМЕТРОВ И ОТРИСОВКА (С АВТОСОРТИРОВКОЙ)
 # =============================================================================
 import matplotlib as mpl
-import numpy as np # На всякий случай убедимся, что np импортирован
+import numpy as np 
+from scipy.linalg import sqrtm
 
-z_raw = embedder.encoder.predict(X_cov_flat)
+# 1. Энкодер теперь сам делает выравнивание и softplus. На выходе — чистые амплитуды (z > 0)
+z_amplitudes = embedder.encoder.predict(X_cov_flat)
 
-# 1. Прогоняем их через слои декодера ДО SpatialPatternDecoder, 
-# чтобы учесть выравнивание (latent_alignment) и получить корректные z для мощностей
-alignment_layer = embedder.decoder.get_layer("latent_alignment")
-z_aligned = alignment_layer(z_raw).numpy() 
+# 2. Физическая мощность — это квадрат амплитуды (P = z^2)
+powers = np.exp(z_amplitudes)
 
-# 2. Переводим в реальные мощности
-powers = np.exp(z_aligned) 
-
-# 3. Извлекаем матрицу паттернов и нормируем 
+# 3. Извлекаем матрицу паттернов из декодера и нормируем 
 spatial_decoder_layer = embedder.decoder.get_layer("spatial_decoder")
-A_learned_raw = spatial_decoder_layer.get_weights()[0]
+A_learned_raw = sqrtm(C_avg) @ spatial_decoder_layer.get_weights()[0]
 A_global = A_learned_raw / np.linalg.norm(A_learned_raw, axis=0) 
 
 # =============================================================================
-# НОВОЕ: СОРТИРОВКА ПО ДИСПЕРСИИ МОЩНОСТИ (ПО УБЫВАНИЮ)
+# СОРТИРОВКА ПО ДИСПЕРСИИ МОЩНОСТИ (ПО УБЫВАНИЮ)
 # =============================================================================
 # Считаем дисперсию (разброс) каждого из N_patterns вдоль всех эпох (axis=0)
 power_variances = np.var(powers, axis=0)
@@ -1020,7 +1230,7 @@ C_global_reg = C_global_mean + alpha * np.trace(C_global_mean) * I
 # Обращаем регуляризованную матрицу
 C_global_inv = np.linalg.inv(C_global_reg)
 
-# Фильтры тоже автоматически получаются отсортированными, так как мы берем столбцы из отсортированной A_global
+# Фильтры тоже автоматически получаются отсортированными
 found_filters = [C_global_inv @ A_global[:, i] for i in range(N_patterns)]
 
 # %%
@@ -1034,7 +1244,7 @@ fig = plt.figure()
 ax = fig.add_subplot(projection='3d')
 
 # Передаем столбцы 0, 1 и 2 в качестве координат X, Y, Z
-ax.scatter(powers[:, 5], powers[:, 3], powers[:, 7], c='blue', marker='o')
+ax.scatter(powers[:, 5], powers[:, 10], powers[:, 34], c='blue', marker='o')
 
 ax.set_xlabel('Ось X')
 ax.set_ylabel('Ось Y')
@@ -1042,47 +1252,6 @@ ax.set_xlabel('Ось Z')
 
 plt.show()
 
-
-# %%
-import numpy as np
-import matplotlib.pyplot as plt
-
-# 1. Расчет матрицы корреляций (20 x 20)
-# rowvar=False указывает, что переменные (компоненты) находятся в столбцах
-corr_matrix = np.corrcoef(powers, rowvar=False)
-
-# 2. Настройка графика
-fig, ax = plt.subplots(figsize=(12, 10))
-
-# Отображаем матрицу в виде тепловой карты
-# cmap='coolwarm' центрирует цвета (синий = -1, белый = 0, красный = 1)
-im = ax.imshow(corr_matrix, cmap='coolwarm', vmin=-1, vmax=1)
-
-# Добавляем цветовую шкалу справа
-cbar = ax.figure.colorbar(im, ax=ax, shrink=0.8)
-cbar.ax.set_ylabel("Коэффициент корреляции", rotation=-90, va="bottom")
-
-# 3. Настройка осей (индексы от 1 до 20)
-num_components = corr_matrix.shape[1]
-ticks = np.arange(num_components)
-labels = [f"C{i+1}" for i in ticks]
-
-ax.set_xticks(ticks)
-ax.set_yticks(ticks)
-ax.set_xticklabels(labels, rotation=45, ha="right")
-ax.set_yticklabels(labels)
-
-# 4. Отображение числовых значений внутри ячеек (по желанию)
-# Из-за плотности 20x20 используем мелкий шрифт
-for i in range(num_components):
-    for j in range(num_components):
-        text = ax.text(j, i, f"{corr_matrix[i, j]:.2f}",
-                       ha="center", va="center", color="black", fontsize=8)
-
-# Финальное оформление
-ax.set_title("Матрица корреляций компонент (NumPy & Matplotlib)", fontsize=14, pad=20)
-fig.tight_layout()
-plt.show()
 
 # %%
 from matplotlib.gridspec import GridSpec
