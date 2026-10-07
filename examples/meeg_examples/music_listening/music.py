@@ -25,7 +25,7 @@ from pyriemann.utils.base import invsqrtm
 from pyriemann.geometry.distance import pairwise_distance
 
 # %%
-fpath = 'C:/Users/ansbel/Downloads/Telegram Desktop/P1_AR_bars.fif'
+fpath = 'C:/Users/ansbel/Downloads/Telegram Desktop/CR_02.fif'
 raw = mne.io.read_raw_fif(fpath, preload=True)
 
 # %%
@@ -53,7 +53,6 @@ data = np.load('C:/Users/ansbel/Downloads/Telegram Desktop/P3_AinC_vs_AinB_15-25
 print(data.files)
 array1 = data['patterns']
 
-# %%
 # %%
 import numpy as np
 import mne

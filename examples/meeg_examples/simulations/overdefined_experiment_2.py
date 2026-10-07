@@ -16,7 +16,6 @@ from pyriemann.geometry.distance import pairwise_distance
 sim_dir = os.path.abspath("C:/Users/ansbel/Documents/GitHub/umap_meeg/examples/meeg_examples/simulations/")
 if sim_dir not in sys.path:
     sys.path.insert(0, sim_dir)
-from signal_simulation import generate_bursty_sources, generate_distributed_sources, generate_complex_sources, generate_sources, generate_switching_microstates, generate_microstates
 from scipy.linalg import eigh
 
 import mne
@@ -28,7 +27,144 @@ import umap
 from umap.parametric_umap import ParametricUMAP
 
 import tensorflow as tf
-from sklearn.model_selection import train_test_split
+
+import scipy.signal
+from scipy.signal import butter, filtfilt, hilbert
+
+def make_microstate_schedule(N, Fs, n_states, dwell_time,
+                             mode='round_robin', smooth_s=0.05):
+    """
+    Возвращает A формы (n_states, N), A[m,t] ∈ [0,1] — насколько микростат m
+    активен в момент t.
+      mode='round_robin' — строго по кругу (0,1,2,...,0,1,2,...)
+      mode='random'      — случайная последовательность без повторов подряд
+    smooth_s — длительность сглаживания фронтов (сек); 0 → ступеньки.
+    """
+    dwell_samples = max(1, int(dwell_time * Fs))
+    n_intervals = int(np.ceil(N / dwell_samples))
+    A = np.zeros((n_states, N))
+
+    if mode == 'round_robin':
+        order = np.arange(n_intervals) % n_states
+    elif mode == 'random':
+        order = np.random.randint(0, n_states, size=n_intervals)
+        for i in range(1, n_intervals):
+            while order[i] == order[i-1]:
+                order[i] = np.random.randint(0, n_states)
+    else:
+        raise ValueError(mode)
+
+    for i, s in enumerate(order):
+        start = i * dwell_samples
+        end   = min(start + dwell_samples, N)
+        A[s, start:end] = 1.0
+
+    if smooth_s > 0:
+        w = max(1, int(smooth_s * Fs))
+        kernel = np.hanning(w + 1)
+        kernel /= kernel.sum()
+        A = np.apply_along_axis(lambda x: np.convolve(x, kernel, mode='same'),
+                                axis=1, arr=A)
+        # sum по состояниям снова ~1 в каждый момент, но не идеально
+        # — можно не нормировать, масштаб задаётся snr_inactive/snr_active
+    return A
+
+def generate_microstate_sources(
+    G, Nsrc, N_microstates=2, sources_per_microstate=10,
+    flanker=25.0, Ts=600, Fs=100,
+    dwell_time=5.0,                # длительность одного микросостояния
+    snr_active=2.0,                # P_target / P_bg, когда микростат активен
+    snr_inactive=0.1,              # P_target / P_bg, когда микростат молчит
+    schedule='round_robin',        # 'round_robin' или 'random'
+    smooth_s=0.05,                 # сглаживание фронтов микростатов
+    transition_freq=0.5,           # ФНЧ огибающей (как в исходной функции)
+):
+    """
+    Все источники (и таргет, и фон) формируются ОДИНАКОВО:
+        signal_k(t) = unit_sinusoid_k(t) · env_unit_k(t) · scale_k(t)
+    где env_unit — LP-фильтрованный положительный шум с E[env_unit²]=1,
+    одна и та же природа для всех.
+
+    Отличия:
+      * фон:   scale = 1 (всегда одинаково "активен").
+      * таргет: scale_k(t) = sqrt( snr_inactive + (snr_active - snr_inactive) · a_μ(k)(t) )
+
+    Микросостояния:
+      * источники 0..Ndistr-1 поделены на N_microstates групп по P штук;
+      * a_μ(t) ∈ {0,1} — расписание, в каждый момент активен один микростат;
+      * источники одной группы активируются синхронно (общая огибающая — у них
+        свои, но их мощность масштабируется одной и той же маской a_μ(t)).
+
+    Средний по времени SNR источника: snr_inactive + Δsnr·mean(a_μ).
+    """
+    N = int(Ts * Fs)
+    flanker_samples = int(flanker * Fs)
+    Ndistr = N_microstates * sources_per_microstate
+    assert Ndistr <= Nsrc, "N_microstates*sources_per_microstate > Nsrc"
+
+    # --- Фильтры ----------------------------------------------------------
+    b, a = butter(5, [8/(Fs/2), 12/(Fs/2)], btype='bandpass')
+    b_lp, a_lp = butter(5, transition_freq / (Fs/2), btype='lowpass')
+
+    # --- Forward model ---------------------------------------------------
+    Gx, Gy, Gz = G[:, 0::3], G[:, 1::3], G[:, 2::3]
+    Nsens, Nsites = Gx.shape
+    GA = np.zeros((Nsens, Nsrc))
+    src_inds = np.random.permutation(Nsites)
+    for i in range(Nsrc):
+        r = np.random.rand(3); r /= np.linalg.norm(r)
+        GA[:, i] = Gx[:, src_inds[i]]*r[0] + Gy[:, src_inds[i]]*r[1] + Gz[:, src_inds[i]]*r[2]
+
+    # --- Несущие (band-pass, единичная огибающая) -------------------------
+    raw_noise = np.random.randn(Nsrc, N + 2*flanker_samples)
+    S_full = filtfilt(b, a, raw_noise, axis=1)
+    S = (S_full[:, flanker_samples:-flanker_samples]
+         if flanker_samples > 0 else S_full.copy())
+
+    # --- Огибающие: одна природа для таргета и фона -----------------------
+    raw_env = np.random.randn(Nsrc, N + 2*flanker_samples)
+    env_full = filtfilt(b_lp, a_lp, raw_env, axis=1)
+    if flanker_samples > 0:
+        env_full = env_full[:, flanker_samples:-flanker_samples]
+
+    # Dähne-подобное смещение: делаем строго положительной
+    env_pos = env_full - env_full.min(axis=1, keepdims=True) + 0.05
+    # Нормируем по RMS, чтобы E[env_unit²] = 1 (истинная средняя мощность 1)
+    env_unit = env_pos / np.sqrt(np.mean(env_pos**2, axis=1, keepdims=True))
+
+    # --- Расписание микросостояний ----------------------------------------
+    A = make_microstate_schedule(
+        N, Fs, N_microstates, dwell_time,
+        mode=schedule, smooth_s=smooth_s
+    )  # (N_microstates, N), ∈ [0,1]
+
+    # --- Синтез источников -------------------------------------------------
+    z = np.zeros((Nsrc, N))
+    for k in range(Nsrc):
+        analytic = hilbert(S[k, :])
+        S_norm   = S[k, :] / (np.abs(analytic) + 1e-12)   # чистая синусоида, амплитуда 1
+
+        if k < Ndistr:
+            mu = k // sources_per_microstate
+            a_k = A[mu]                                     # (N,) ∈ [0,1]
+            snr_k = snr_inactive + (snr_active - snr_inactive) * a_k
+            scale = np.sqrt(np.clip(snr_k, 1e-12, None))    # амплитудный масштаб
+        else:
+            scale = 1.0                                     # bg baseline
+
+        S[k, :] = S_norm * env_unit[k] * scale
+        z[k, :] = (env_unit[k]**2) * (scale**2 if np.isscalar(scale)
+                                      else scale**2)
+
+    X_s  = GA[:, :Ndistr]  @ S[:Ndistr, :]
+    X_bg = GA[:, Ndistr:]  @ S[Ndistr:, :]
+
+    X_n = np.random.randn(Nsens, N)
+    X_n = X_n - X_n.mean(axis=1, keepdims=True)
+    X_n = X_n / X_n.std(axis=1, keepdims=True)
+
+    gt_states = A
+    return X_s, X_bg, X_n, z, GA, S, gt_states
 
 # =============================================================================
 # 1. ЗАГРУЗКА И ВЫБОР ЭЭГ КАНАЛОВ (МОНТАЖ 10-20)
@@ -40,31 +176,7 @@ fwd = mne.read_forward_solution(fwd_fname, verbose=False)
 info = mne.io.read_info(info_fname, verbose=False)
 Fs = info['sfreq']
 
-# 25 каналов из вашей сетки, образующих симметричный монтаж 10-20:
-montage_25 = [
-    # Лобно-полюсные и сагиттальные вспомогательные
-    'Fp1', 'Fpz', 'Fp2',
-    # Лобные
-    'F7', 'F3', 'Fz', 'F4', 'F8',
-    # Лобно-центральные
-    'FCz',
-    # Височные и центральные
-    'T7', 'C3', 'Cz', 'C4', 'T8',
-    # Центрально-теменные
-    'CPz',
-    # Теменные
-    'P7', 'P3', 'Pz', 'P4', 'P8',
-    # Теменно-затылочные
-    'POz',
-    # Затылочные
-    'O1', 'Oz', 'O2',
-    # Нижний затылочный ориентир
-    'Iz'
-]
-
-# Выбираем только те ЭЭГ каналы, которые есть в нашем списке
-# Функция сама проигнорирует каналы из списка, которых нет в info
-picks = mne.pick_types(info, eeg=True, meg=False, selection=montage_25)
+picks = mne.pick_types(info, eeg=True, meg=False)
 info_sub = mne.pick_info(info, sel=picks)
 G_sub = fwd['sol']['data'][picks, :]  # Форма: (M_channels, N_vertices * 3)
 
@@ -75,42 +187,33 @@ M_channels = len(picks)
 # =============================================================================
 Ts = 600          
 Nsrc = 100         
-Ndistr = 3          
-flanker = 1.0        
+N_microstates = 2               
+sources_per_microstate = 1
+Ndistr = N_microstates * sources_per_microstate  
+
+flanker = 25.0        
 gamma = 0.1          
-current_snr = 10 ** 0
 
 Wsize = 2
 Ssize = 0.5
 overlap = Wsize - Ssize
 
-print("Генерация источников...")
-# X_s, X_bg, X_n, z, GA, S, gt_positions_idx, gt_orientations = generate_bursty_sources(
-#     G_sub, Nsrc, Ndistr, flanker, Ts, Fs, 
-#     block_duration=5.0, 
-#     burst_prob=0.3 
-# )
-# X_s, X_bg, X_n, z, GA, S = generate_distributed_sources(
-#     G_sub, Nsrc, Ndistr, flanker, Ts, Fs
-# )
-# X_s, X_bg, X_n, z, GA, S = generate_complex_sources(
-#     G_sub, Nsrc, Ndistr, flanker, Ts, Fs, 
-# )
+print("Генерация сетевых источников...")
 
-# print("Генерация переключающихся микросостояний...")
-# X_s, X_bg, X_n, z, GA, S, gt_states_samples = generate_switching_microstates(
-#     G_sub, Nsrc, Ndistr=3, flanker=flanker, Ts=Ts, Fs=Fs, 
-#     min_dur=0.8, max_dur=2.5, snr_target=4.0
-# )
-X_s, X_bg, X_n, z, GA, S, activity = generate_microstates(
-    G_sub, Nsrc, Ndistr=1,
-    flanker=flanker, Ts=Ts, Fs=Fs,
-    min_seg_dur=5, max_seg_dur=10.0,
-    transition=0.1,
-    # rng=np.random.default_rng(42),
+X_s, X_bg, X_n, z, GA, S, gt_states = generate_microstate_sources(
+    G_sub, Nsrc,
+    N_microstates=N_microstates,
+    sources_per_microstate=sources_per_microstate,
+    flanker=25.0, Ts=Ts, Fs=Fs,
+    dwell_time=20.0,         
+    snr_active=1.0,          
+    snr_inactive=0.01,        
+    schedule='round_robin',
+    smooth_s=0.05,
 )
 
-X = current_snr * X_s + X_bg + gamma * X_n / np.linalg.norm(X_s, 'fro')
+gamma = 0.1
+X = X_s + X_bg + gamma * X_n
 X = X / np.std(X)
 
 # =============================================================================
@@ -155,17 +258,6 @@ covmats_w = Ww.T @ covmats @ Ww
 assert np.allclose(np.mean(covmats_w, axis=0), np.eye(n_components), atol=1e-5), "Отбеливание некорректно!"
 
 # %%
-from mne.preprocessing import ICA
-ica = ICA(method='fastica')
-
-# 3. Обучение ICA на отфильтрованных данных
-ica.fit(raw)
-
-# 4. Визуализация компонент (для ручного поиска артефактов глаз/сердца)
-ica.plot_components()  # Карты топографии компонент
-# ica.plot_sources(raw)  # Временные ряды компонент
-
-# %%
 # =============================================================================
 # 3.5 ИЗВЛЕЧЕНИЕ ДИСПЕРСИИ ИСТИННЫХ ИСТОЧНИКОВ И ИХ МАСШТАБИРОВАНИЕ
 # =============================================================================
@@ -178,9 +270,7 @@ info_S = mne.create_info(
     ch_types='misc'
 )
 
-SS = S.copy()
-SS[:Ndistr] *= 1
-raw_S = mne.io.RawArray(SS, info_S)
+raw_S = mne.io.RawArray(S, info_S)
 
 # 2. Нарезаем на эпохи СТРОГО ТАК ЖЕ, как резали X
 epochs_S = mne.make_fixed_length_epochs(
@@ -208,16 +298,123 @@ GA_scales_squared = np.linalg.norm(GA_target, axis=0)**2
 # Умножаем дисперсии на квадраты норм топографий
 z_true_epochs = z_true_epochs * GA_scales_squared
 
-plt.plot(true_source_variances[:,0])
+plt.plot(true_source_variances[:,:sources_per_microstate])
+plt.plot(-true_source_variances[:,sources_per_microstate:sources_per_microstate*2])
+
+# %%
+from mne.preprocessing import ICA
+ica = ICA(method='fastica')
+
+# 3. Обучение ICA на отфильтрованных данных
+ica.fit(raw)
+
+# %%
+# 4. Визуализация компонент (для ручного поиска артефактов глаз/сердца)
+ica.plot_components()  # Карты топографии компонент
+# ica.plot_sources(raw)  # Временные ряды компонент
+
+# %%
+# =============================================================================
+# 2. ИЗВЛЕЧЕНИЕ ЭПОХИРОВАННЫХ ИСТОЧНИКОВ И ИХ МОЩНОСТИ
+# =============================================================================
+print("Извлечение источников ICA и расчет их дисперсии на эпохах...")
+# Извлекаем непрерывные временные ряды найденных компонент
+ica_sources_raw = ica.get_sources(raw)
+
+# Нарезаем на эпохи СТРОГО ТАК ЖЕ, как мы резали X и S
+epochs_ica = mne.make_fixed_length_epochs(
+    ica_sources_raw, 
+    duration=Wsize, 
+    overlap=overlap, 
+    preload=True, 
+    verbose=False
+)
+epochs_ica_data = epochs_ica.get_data(copy=False) # (n_epochs, n_components, n_samples)
+
+# Считаем мощность (дисперсию) каждой компоненты на каждой эпохе
+P_ica = np.var(epochs_ica_data, axis=2)  # (n_epochs, n_components)
+
+# Паттерны (топограммы) ICA
+# get_components() возвращает матрицу смешивания размера (n_channels, n_components)
+A_ica = ica.get_components() 
+
+# =============================================================================
+# 3. БЕЗОПАСНОЕ СОГЛАСОВАНИЕ (ICA VS ИСТИННЫЕ ИСТОЧНИКИ)
+# =============================================================================
+P_true = true_source_variances[:, :Ndistr]  # Только таргетные!
+n_ica = P_ica.shape[1]
+n_true = P_true.shape[1]
+
+# Используем P_true.T, а не true_source_variances.T
+C_corr_ica = np.corrcoef(P_ica.T, P_true.T)
+corr_block_ica = np.abs(C_corr_ica[:n_ica, n_ica:])  # Размеры: (n_ica, Ndistr)
+
+# Венгерский алгоритм
+row_ica, col_ica = linear_sum_assignment(-corr_block_ica)
+
+# Сортируем пары по индексу истинного источника
+sort_idx_ica = np.argsort(col_ica)
+matched_ica_idx = row_ica[sort_idx_ica]
+matched_true_idx_ica = col_ica[sort_idx_ica]
+num_matched_ica = len(matched_true_idx_ica)
+
+P_ica_matched = P_ica[:, matched_ica_idx]
+A_ica_matched = A_ica[:, matched_ica_idx]
+
+print(f"Из {Ndistr} истинных источников ICA сопоставлено {num_matched_ica} компонент.")
+
+# =============================================================================
+# 4. ТОПОГРАММЫ И КОРРЕЛЯЦИИ
+# =============================================================================
+fig, axes = plt.subplots(2, num_matched_ica, figsize=(4 * num_matched_ica, 7))
+if num_matched_ica == 1: axes = np.expand_dims(axes, axis=1)
+
+A_true = GA[:, :Ndistr]    
+for i in range(num_matched_ica):
+    t_idx = matched_true_idx_ica[i]
+    
+    ax_t = axes[0, i]
+    mne.viz.plot_topomap(A_true[:, t_idx], info_sub, axes=ax_t, show=False, cmap='RdBu_r')
+    ax_t.set_title(f'True Source {t_idx+1}')
+
+    ax_l = axes[1, i]
+    mne.viz.plot_topomap(A_ica_matched[:, i], info_sub, axes=ax_l, show=False, cmap='RdBu_r')
+    ax_l.set_title(f'ICA Comp {matched_ica_idx[i]}')
+
+plt.tight_layout()
+plt.show()
+
+# --- Графики мощностей ---
+P_true_matched_ica = P_true[:, matched_true_idx_ica]
+
+P_true_n_ica = P_true_matched_ica / (P_true_matched_ica.std(axis=0, keepdims=True) + 1e-9)
+P_pred_n_ica = P_ica_matched / (P_ica_matched.std(axis=0, keepdims=True) + 1e-9)
+
+correlations_ica = [np.corrcoef(P_true_n_ica[:, i], P_pred_n_ica[:, i])[0, 1] for i in range(num_matched_ica)]
+
+fig, axes = plt.subplots(num_matched_ica, 1, figsize=(12, 3 * num_matched_ica), sharex=True)
+if num_matched_ica == 1: axes = [axes]
+
+fig.suptitle(f'[ICA Baseline] Мощности: совпало {num_matched_ica} из {Ndistr} источников', y=1.02, fontweight='bold')
+
+for i in range(num_matched_ica):
+    ax = axes[i]
+    ax.plot(P_true_n_ica[:, i], 'b-', lw=2.5, alpha=0.6, label='Истинная')
+    ax.plot(P_pred_n_ica[:, i], 'g', lw=1.5, label='Предсказанная (ICA)')
+    ax.set_title(f'True {matched_true_idx_ica[i]+1} vs ICA {matched_ica_idx[i]} (corr = {correlations_ica[i]:.3f})')
+    ax.set_ylabel('Норм. мощность')
+    ax.legend(loc='upper right')
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+plt.xlabel('Окна')
+plt.tight_layout()
+plt.show()
 
 # %%
 dists_init = pairwise_distance(covmats_w, metric='riemann')
 
 # %%
-import matplotlib.pyplot as plt
-import umap
-
-reducer = umap.UMAP(n_components=2, n_neighbors=25, metric='precomputed')
+reducer = umap.UMAP(n_components=2, n_neighbors=20, metric='precomputed')
 coords = reducer.fit_transform(dists_init)
 
 # %%
@@ -226,39 +423,10 @@ plt.scatter(coords[:, 0], coords[:, 1], s=5, cmap='Spectral')
 
 plt.xlabel('UMAP 1')
 plt.ylabel('UMAP 2')
-plt.colorbar() 
+plt.colorbar()
 plt.show()
 
 # %%
-def init_identity_with_noise(shape, dtype=None):
-    M, N = shape
-    init = np.zeros((M, N), dtype=np.float32)
-    # Первые M столбцов — единичные
-    for i in range(min(M, N)):
-        init[i, i] = 1.0
-    # Остальные — случайные малые, чтобы после нормализации не были нулевыми
-    if N > M:
-        init[:, M:] = np.random.normal(0, 0.1, (M, N - M)).astype(np.float32)
-    return tf.constant(init, dtype=dtype)
-n_ch_white = covmats_w.shape[1]
-
-# =============================================================================
-# ПОДГОТОВКА ДАННЫХ (УНИКАЛЬНЫЕ ЭЛЕМЕНТЫ)
-# =============================================================================
-M_channels = covmats_w.shape[1]
-
-# Индексы верхней треугольной матрицы
-idx_i, idx_j = np.triu_indices(M_channels)
-
-# Множители: 1.0 для диагонали, sqrt(2) для внедиагональных
-multipliers = np.where(idx_i == idx_j, 1.0, np.sqrt(2.0)).astype(np.float32)
-
-# Вытаскиваем уникальные элементы и сразу масштабируем
-X_cov_flat = (covmats_w[:, idx_i, idx_j] * multipliers).astype(np.float32)
-
-input_dim = int(X_cov_flat.shape[1]) # Теперь размерность M*(M+1)/2
-print(f"Новая размерность входа: {input_dim}")
-
 def build_unvec_matrix(M):
     """Создает матрицу для быстрого преобразования вектора обратно в симметричную матрицу"""
     D = M * (M + 1) // 2
@@ -268,101 +436,9 @@ def build_unvec_matrix(M):
         if i == j:
             W[k, i * M + j] = 1.0
         else:
-            # Делим на sqrt(2), чтобы снять примененный ранее масштаб
             W[k, i * M + j] = 1.0 / np.sqrt(2.0)
             W[k, j * M + i] = 1.0 / np.sqrt(2.0)
     return W
-
-# Инициализируем константу один раз
-W_UNVEC = tf.constant(build_unvec_matrix(n_ch_white), dtype=tf.float32)
-
-def reconstruct_sym_matrix(vecs, M):
-    """Дифференцируемое восстановление (batch, D) -> (batch, M, M)"""
-    C_flat = tf.matmul(vecs, W_UNVEC)
-    return tf.reshape(C_flat, [-1, M, M])
-@tf.keras.utils.register_keras_serializable()
-class BiMapLayer(tf.keras.layers.Layer):
-    """
-    Билинейное преобразование: X_out = W_norm · X · W_norm^T
-
-    W_norm — строчно-нормированная версия обучаемой W:
-        W_norm[i] = W[i] / ||W[i]||
-
-    Это гарантирует ||w_i|| = 1 для всех фильтров, а штраф
-    ||W_norm W_norm^T − I||_F^2 тогда отвечает именно за
-    ортогональность направлений (углы между фильтрами).
-    """
-    def __init__(self, d_out, orth_weight=0.01, **kwargs):
-        super().__init__(**kwargs)
-        self.d_out = int(d_out)
-        self.orth_weight = float(orth_weight)
-
-    def build(self, input_shape):
-        self.d_in = int(input_shape[-1])
-        # Инициализация: первые d_out строк — единичные по соответствующим каналам
-        init_val = np.eye(self.d_out, self.d_in, dtype=np.float32)
-        self.W = self.add_weight(
-            shape=(self.d_out, self.d_in),
-            initializer=tf.keras.initializers.Constant(init_val),
-            trainable=True,
-            name="W_bimap"
-        )
-        super().build(input_shape)
-
-    def call(self, inputs):
-        # --- 1. Нормировка строк: ‖w_i‖ = 1 ---
-        W_norm = tf.math.l2_normalize(self.W, axis=1)    # (d_out, d_in)
-
-        # --- 2. Билинейное преобразование ---
-        X_out = tf.einsum('ij,bjk,lk->bil', W_norm, inputs, W_norm)
-        X_out = 0.5 * (X_out + tf.transpose(X_out, perm=[0, 2, 1]))
-
-        # --- 3. Штраф на ортогональность направлений ---
-        if self.orth_weight > 0.0:
-            WWT = tf.matmul(W_norm, W_norm, transpose_b=True)  # (d_out, d_out)
-            I = tf.eye(self.d_out)
-            orth_penalty = tf.reduce_sum(tf.square(WWT - I))
-            self.add_loss(self.orth_weight * orth_penalty)
-
-        return X_out
-
-
-@tf.keras.utils.register_keras_serializable()
-class LogDiagScaleLayer(tf.keras.layers.Layer):
-    """
-    z_i = softplus(s_i) · log( max( (W C W^T)_{ii}, eps ) ) + b_i
-
-    s_i, b_i — обучаемые параметры:
-      * softplus(s_i) > 0 — масштаб динамического диапазона по оси i;
-      * b_i — аддитивный сдвиг (компенсирует разницу в ||g_i||^2 между источниками).
-    """
-    def __init__(self, n_filters, epsilon=1e-6, **kwargs):
-        super().__init__(**kwargs)
-        self.n_filters = int(n_filters)
-        self.epsilon = epsilon
-
-    def build(self, input_shape):
-        # s_raw: после softplus(0) ≈ 0.69 — мягкий нейтральный старт
-        self.s_raw = self.add_weight(
-            shape=(self.n_filters,),
-            initializer='zeros',
-            trainable=True,
-            name='log_scale_raw'
-        )
-        self.bias = self.add_weight(
-            shape=(self.n_filters,),
-            initializer='zeros',
-            trainable=True,
-            name='log_bias'
-        )
-        super().build(input_shape)
-
-    def call(self, inputs):
-        diags = tf.linalg.diag_part(inputs)                       # (batch, n_filters)
-        z = tf.math.log(tf.maximum(diags, self.epsilon))          # log-power
-
-        scale = tf.nn.softplus(self.s_raw)                         # > 0
-        return scale * z + self.bias
 
 @tf.keras.utils.register_keras_serializable()
 class UnflattenSymmetricLayer(tf.keras.layers.Layer):
@@ -371,73 +447,136 @@ class UnflattenSymmetricLayer(tf.keras.layers.Layer):
         super().__init__(**kwargs)
         self.M = int(M)
 
+    def build(self, input_shape):
+        w_init = build_unvec_matrix(self.M)
+        self.W_UNVEC = self.add_weight(
+            shape=w_init.shape,
+            initializer=tf.keras.initializers.Constant(w_init),
+            trainable=False,  
+            name='W_UNVEC'
+        )
+        super().build(input_shape)
+
     def call(self, inputs):
-        return reconstruct_sym_matrix(inputs, self.M)
-    
-# =============================================================================
-# 3. СБОРКА АРХИТЕКТУРЫ ЭНКОДЕРА (Диагонализирующий фильтр)
-# =============================================================================
+        # Дифференцируемое восстановление (batch, D) -> (batch, M, M)
+        C_flat = tf.matmul(inputs, self.W_UNVEC)
+        return tf.reshape(C_flat, [-1, self.M, self.M])
 
-M_channels = covmats_w.shape[1]
-N_patterns = 3
+    def get_config(self):
+        config = super().get_config()
+        config.update({"M": self.M})
+        return config
 
-inputs_enc = tf.keras.Input(shape=(input_dim,), dtype=tf.float32, name="encoder_input")
+@tf.keras.utils.register_keras_serializable()
+class BiMapLayer(tf.keras.layers.Layer):
+    """
+    Билинейное преобразование: X_out = W_norm · X · W_norm^T
+    """
+    def __init__(self, d_out, **kwargs):
+        super().__init__(**kwargs)
+        self.d_out = int(d_out)
 
-x = UnflattenSymmetricLayer(M=M_channels, name="unflatten_to_sym")(inputs_enc)
-x = BiMapLayer(d_out=N_patterns, orth_weight=0.01, name="bimap_1")(x)
-z_latent = LogDiagScaleLayer(n_filters=N_patterns, epsilon=1e-4, name="log_diag_scale")(x)
+    def build(self, input_shape):
+        self.d_in = int(input_shape[-1])
+        
+        # Базовая структура единичной матрицы
+        init_val = np.eye(self.d_out, self.d_in, dtype=np.float32)
+        
+        # Добавляем небольшой гауссовский шум для нарушения симметрии
+        noise = np.random.normal(loc=0.0, scale=0.01, size=(self.d_out, self.d_in)).astype(np.float32)
+        init_val = init_val + noise
+        
+        self.W = self.add_weight(
+            shape=(self.d_out, self.d_in),
+            initializer=tf.keras.initializers.Constant(init_val),
+            trainable=True,
+            name="W_bimap"
+        )
+        super().build(input_shape)
+            
+    def call(self, inputs):
+        W_norm = tf.math.l2_normalize(self.W, axis=1)    
+        X_out = tf.einsum('ij,bjk,lk->bil', W_norm, inputs, W_norm)
+        X_out = 0.5 * (X_out + tf.transpose(X_out, perm=[0, 2, 1]))
 
-encoder = tf.keras.Model(inputs=inputs_enc, outputs=z_latent, name="spdnet_diag_encoder")
+        return X_out
 
-# =============================================================================
-# 5. ПОДГОТОВКА ДАННЫХ
-# =============================================================================
-M_channels = covmats_w.shape[1]
-idx_i, idx_j = np.triu_indices(M_channels)
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "d_out": self.d_out,
+        })
+        return config
+
+@tf.keras.utils.register_keras_serializable()
+class LogDiagScaleLayer(tf.keras.layers.Layer):
+    """
+    z_i = log( scale_i * max( (W C W^T)_{ii}, eps ) )
+    Штраф за внедиагональные элементы рассчитывается на основе матрицы корреляции.
+    Масштаб строго больше нуля благодаря функции softplus, выступает как усилитель дисперсии.
+    """
+    def __init__(self, n_filters, epsilon=1e-9, off_diag_penalty=1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.n_filters = int(n_filters)
+        self.epsilon = epsilon
+        self.off_diag_penalty = float(off_diag_penalty)
+
+    def build(self, input_shape):
+        super().build(input_shape)
+
+    def call(self, inputs):
+        diags = tf.linalg.diag_part(inputs)
+        
+        if self.off_diag_penalty > 0.0 and self.n_filters > 1:
+            inv_std = tf.math.rsqrt(tf.maximum(diags, self.epsilon))
+            inv_std_col = tf.expand_dims(inv_std, axis=-1)
+            inv_std_row = tf.expand_dims(inv_std, axis=-2)
+            R = inputs * inv_std_col * inv_std_row
+            
+            eps_eye = self.epsilon * tf.eye(self.n_filters, dtype=inputs.dtype)
+            log_det_R = tf.linalg.logdet(R + eps_eye)
+            
+            N = tf.cast(self.n_filters, dtype=inputs.dtype)
+            pairs_count = tf.maximum(N * (N - 1.0) / 2.0, 1.0) 
+            
+            pham_penalty = self.off_diag_penalty * tf.reduce_mean(-log_det_R) / pairs_count
+            self.add_loss(pham_penalty)
+                
+        return tf.math.log(tf.maximum(diags, self.epsilon))
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "n_filters": self.n_filters,
+            "epsilon": self.epsilon,
+            "off_diag_penalty": self.off_diag_penalty
+        })
+        return config
+
+# %%
+Npatt = 1 
+
+idx_i, idx_j = np.triu_indices(n_components)
 multipliers = np.where(idx_i == idx_j, 1.0, np.sqrt(2.0)).astype(np.float32)
-
 X_cov_flat = (covmats_w[:, idx_i, idx_j] * multipliers).astype(np.float32)
 input_dim = int(X_cov_flat.shape[1])
-print(f"Обучение ParametricUMAP: N_dim={N_patterns}, N_patterns={N_patterns}")
 
-# =============================================================================
-# 7. ПОДГОТОВКА ПОЛНОЙ ВЫБОРКИ (БЕЗ РАЗДЕЛЕНИЯ)
-# =============================================================================
+inputs_enc = tf.keras.Input(shape=(input_dim,), dtype=tf.float32)
+x = UnflattenSymmetricLayer(M=n_components)(inputs_enc)
+x = BiMapLayer(d_out=Npatt, name="bimap_1")(x)
+z_latent = LogDiagScaleLayer(n_filters=Npatt, epsilon=1e-9)(x)
+encoder = tf.keras.Model(inputs=inputs_enc, outputs=z_latent)
 
-# Используем все доступные данные без сплита
-X_train = X_cov_flat
-dist_matrix_train = dists_init
-
-print(f"Размер выборки для обучения: {len(X_train)} окон.")
-
-# =============================================================================
-# 8. КОЛЛБЕКИ И ЗАПУСК
-# =============================================================================
-
-n_neighbors = 20
-N_dim = N_patterns
-
-early_stopping = tf.keras.callbacks.EarlyStopping(
-    monitor='loss',        
-    patience=30,           
-    min_delta=1e-5,        
-    restore_best_weights=True
-)
-
+early_stopping = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=50, min_delta=1e-4)
 embedder = ParametricUMAP(
-    encoder=encoder,
-    n_components=N_dim,
-    dims=(input_dim,),
-    metric="precomputed",
-    n_neighbors=n_neighbors,
-    verbose=True,
-    keras_fit_kwargs={"callbacks": [early_stopping]} 
+    encoder=encoder, n_components=Npatt, dims=(input_dim,), 
+    metric="precomputed", n_neighbors=20, verbose=True,
+    keras_fit_kwargs={"callbacks": [early_stopping], "verbose": 1}
 )
 
-embedder.loss_report_frequency = 100
-embedder.n_training_epochs = 5
-
-embedder.fit(X_train, precomputed_distances=dist_matrix_train)
+embedder.n_training_epochs = 3 
+embedder.loss_report_frequency = embedder.n_training_epochs * 100
+embedder.fit(X_cov_flat, precomputed_distances=dists_init)
 
 # %%
 # =============================================================================
@@ -461,42 +600,23 @@ ax1.grid(True, linestyle='--', alpha=0.7)
 plt.tight_layout()
 plt.show()
 
-
 # %%
-import numpy as np
-
-# =============================================================================
-# 1. ИЗВЛЕЧЕНИЕ ВЕСОВ ФИЛЬТРОВ ИЗ МОДЕЛИ
-# =============================================================================
-# Получаем веса обученного слоя BiMap. Размерность: (N_patterns, n_components_ssd)
+# Матрица фильтров в пространстве SSD (каждый столбец — отдельный фильтр)
 W_bimap = embedder.encoder.get_layer("bimap_1").get_weights()[0]
 
-# Матрица фильтров в пространстве SSD (каждый столбец — отдельный фильтр)
-W_filters_ssd = W_bimap.T 
-
 # Фильтры в исходном пространстве сенсоров: X_latent = W_bimap @ W_ssd.T @ X_sensor
-W_filters_sensor = Ww @ W_filters_ssd
+W_filters_sensor = Ww @ W_bimap.T
 
 # =============================================================================
 # 2. РАСЧЕТ ИСТИННЫХ МОЩНОСТЕЙ ИСТОЧНИКОВ
 # =============================================================================
 # Считаем физические мощности напрямую для каждого окна: diag(W C W^T)
-powers_true = np.zeros((len(covmats_w), N_patterns))
+powers_true = np.zeros((len(covmats_w), Npatt))
 for i, C in enumerate(covmats_w):
     C_filtered = W_bimap @ C @ W_bimap.T
     powers_true[i] = np.diag(C_filtered)
 
-# =============================================================================
-# 3. ОЦЕНКА ПАТТЕРНОВ ЧЕРЕЗ C @ W (В СЕНСОРНОМ ПРОСТРАНСТВЕ)
-# =============================================================================
-# Усредненная ковариационная матрица в пространстве SSD
-C_avg_ssd = np.mean(covmats_w, axis=0)
-
-# Паттерны в пространстве SSD
-A_ssd = C_avg_ssd @ W_filters_ssd
-
-# Проекция паттернов обратно в исходное пространство сенсоров
-A_sensor_raw = np.linalg.pinv(Ww.T) @ A_ssd
+A_sensor_raw =  np.mean(covmats, axis=0) @ W_filters_sensor
 
 # Нормировка физических паттернов для визуализации
 scales = np.linalg.norm(A_sensor_raw, axis=0)
@@ -518,85 +638,236 @@ print(f"Порядок компонент по убыванию средней �
 # =============================================================================
 # 5. СПИСКИ ДЛЯ ОТРИСОВКИ MNE
 # =============================================================================
-found_filters = [W_sorted[:, i] for i in range(N_patterns)]
-found_patterns = [A_sorted[:, i] for i in range(N_patterns)]
+found_filters = [W_sorted[:, i] for i in range(Npatt)]
+found_patterns = [A_sorted[:, i] for i in range(Npatt)]
+
+# %%
+from scipy.linalg import null_space
+
+n_iterations = sources_per_microstate * N_microstates
+Npatt = 1
+
+W_bimap_list = [] 
+history_list = []
+
+# Списки для сохранения результатов каждой итерации
+covmats_reduced_list = []  
+# dists_list = []            
+
+for it in range(n_iterations):
+    print(f"\n{'='*50}\n ИТЕРАЦИЯ {it + 1} ИЗ {n_iterations}\n{'='*50}")
+    
+    # 1. ПОДГОТОВКА ПОДПРОСТРАНСТВА И РАССТОЯНИЙ
+    if it == 0:
+        # Пропускаем лишние вычисления: берем уже готовые исходные данные
+        V = np.eye(n_components)
+        covmats_reduced = covmats_w.copy()
+        dists_current = dists_init.copy()
+    else:
+        # Строим базис нуль-пространства из всех ранее найденных фильтров
+        W_stacked = np.vstack(W_bimap_list)
+        V = null_space(W_stacked).T
+        M_current = V.shape[0]
+        
+        # Проецируем ковариации в меньшую размерность
+        covmats_reduced = np.zeros((len(covmats_w), M_current, M_current))
+        for i in range(len(covmats_w)):
+            covmats_reduced[i] = V @ covmats_w[i] @ V.T
+
+        # Идеальный перерасчет топологии без регуляризации
+        # dists_current = pairwise_distance(covmats_reduced, metric='riemann')
+        # dists_current = pairwise_distance(covmats_reduced, metric='riemann')
+    
+    # Сохраняем спроецированные матрицы и их дистанции в списки
+    covmats_reduced_list.append(covmats_reduced.copy())
+    # dists_list.append(dists_current.copy())
+
+    M_current = V.shape[0]
+    
+    # 2. ВЕКТОРИЗАЦИЯ УМЕНЬШЕННЫХ КОВАРИАЦИЙ
+    idx_i, idx_j = np.triu_indices(M_current)
+    multipliers = np.where(idx_i == idx_j, 1.0, np.sqrt(2.0)).astype(np.float32)
+    X_cov_flat = (covmats_reduced[:, idx_i, idx_j] * multipliers).astype(np.float32)
+    input_dim = int(X_cov_flat.shape[1])
+
+    # 3. ИНИЦИАЛИЗАЦИЯ И ОБУЧЕНИЕ МОДЕЛИ
+    tf.keras.backend.clear_session() # Очищаем память
+    
+    inputs_enc = tf.keras.Input(shape=(input_dim,), dtype=tf.float32)
+    x = UnflattenSymmetricLayer(M=M_current)(inputs_enc)
+    layer_name = f"bimap_{it}"
+    x = BiMapLayer(d_out=Npatt, name=layer_name)(x)
+    z_latent = LogDiagScaleLayer(n_filters=Npatt, epsilon=1e-9)(x)
+    encoder = tf.keras.Model(inputs=inputs_enc, outputs=z_latent)
+
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=50, min_delta=1e-4)
+    embedder = ParametricUMAP(
+        encoder=encoder, n_components=Npatt, dims=(input_dim,), 
+        metric="precomputed", n_neighbors=20, verbose=True,
+        keras_fit_kwargs={"callbacks": [early_stopping], "verbose": 1}
+    )
+
+    embedder.n_training_epochs = 3
+    embedder.loss_report_frequency = embedder.n_training_epochs * 100
+
+    embedder.fit(X_cov_flat, precomputed_distances=dists_current)
+    history_list.append(embedder._history)
+    
+    # 4. ИЗВЛЕЧЕНИЕ ФИЛЬТРА И ВОЗВРАТ В ИСХОДНОЕ ПРОСТРАНСТВО
+    # w_reduced имеет размер (1, M_current)
+    w_reduced = encoder.get_layer(layer_name).get_weights()[0]
+    
+    # Проецируем обратно в исходное отбеленное пространство: (1, M_current) @ (M_current, M) -> (1, M)
+    w_orig = w_reduced @ V
+    
+    # Нормализуем
+    w_orig = w_orig / np.linalg.norm(w_orig, axis=1, keepdims=True)
+    W_bimap_list.append(w_orig)
+
+# %%
+# =============================================================================
+# ПОСТПРОЦЕССИНГ
+# =============================================================================
+W_bimap_stacked = np.vstack(W_bimap_list)
+W_filters_sensor = Ww @ W_bimap_stacked.T
+
+# Дальнейший код для мощностей, сортировки и отрисовки
+
+# 2. РАСЧЕТ ИСТИННЫХ МОЩНОСТЕЙ ИСТОЧНИКОВ
+powers = np.zeros((len(covmats_w), n_iterations * Npatt))
+for i, C in enumerate(covmats_w):
+    # Применяем матрицу ко всем ИСХОДНЫМ отбеленным ковариациям
+    C_filtered = W_bimap_stacked @ C @ W_bimap_stacked.T
+    powers[i] = np.diag(C_filtered)
+
+# Расчет паттернов: A = Sigma_mean * W
+A_sensor_raw = np.mean(covmats, axis=0) @ W_filters_sensor
+
+# Нормировка физических паттернов для визуализации
+scales = np.linalg.norm(A_sensor_raw, axis=0)
+A_global_norm = A_sensor_raw / scales
+
+found_filters = [W_filters_sensor[:, i] for i in range(n_iterations * Npatt)]
+found_patterns = [A_global_norm[:, i] for i in range(n_iterations * Npatt)]
+
+# %%
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Вычисляем матрицу ковариации один раз, чтобы использовать для графиков и текста
+cov_matrix = np.cov(found_filters @ raw.get_data()) 
+
+fig, ax = plt.subplots(figsize=(6, 6)) # Увеличим размер,  чтобы цифры поместились
+im = ax.imshow(cov_matrix, cmap='viridis')
+
+# Добавляем colorbar
+plt.colorbar(im)
+
+# Добавляем числа в каждую ячейку
+
+rows, cols = cov_matrix.shape
+for i in range(rows):
+    for j in range(cols):
+        value = cov_matrix[i, j]
+        
+        # Форматирование: '.2f' для обычных чисел (0.12), '.2e' если порядок очень мал (1.23e-05)
+        text_label = f"{value:.2f}" 
+        
+        # Меняем цвет текста в зависимости от яркости ячейки, чтобы его было видноS
+        # (выбираем белый для темных ячеек, черный для светлых)
+        text_color = "white" if im.norm(value) < 0.5 else "black"
+        
+        ax.text(j, i, text_label,
+                ha="center", va="center", 
+                color=text_color, fontsize=9)
+
+plt.title("Матрица ковариации с числовыми значениями")
+plt.show()
 
 # %%
 from scipy.optimize import linear_sum_assignment
 
 # =============================================================================
-# 6. СОГЛАСОВАНИЕ ВЫУЧЕННЫХ ПАТТЕРНОВ С ИСТИННЫМИ ИСТОЧНИКАМИ
+# 6. БЕЗОПАСНОЕ СОГЛАСОВАНИЕ (КОГДА Npatt != Ndistr)
 # =============================================================================
+# Убедитесь, что вы используете P_learned = powers.copy() (так как выше вы назвали переменную powers)
+P_learned = powers.copy()  # (n_epochs, 12)
+A_true = GA[:, :Ndistr]    # (Nsens, 6)
+ga_scales_sq = np.linalg.norm(A_true, axis=0) ** 2            
+P_true = true_source_variances[:, :Ndistr] * ga_scales_sq    # (n_epochs, 6)
 
-# Истинные топографии целевых источников и их масштабы
-A_true = GA[:, :Ndistr]                              # (Nsens, Ndistr)
-ga_scales_sq = np.linalg.norm(A_true, axis=0) ** 2   # ||g_i||^2
+n_learned = P_learned.shape[1] # В вашем случае 12
+n_true = P_true.shape[1]       # В вашем случае 6
 
-# Истинная линейная мощность источника в сенсорном пространстве (по эпохам)
-# z_true_epochs уже считается в блоке 3.5, но убедимся, что это именно линейная мощность
-P_true = true_source_variances[:, :Ndistr] * ga_scales_sq   # (n_epochs, Ndistr)
+# Матрица корреляций (18x18)
+C_corr = np.corrcoef(P_learned.T, P_true.T)                  
 
-# Выученная линейная мощность фильтров в whitened-пространстве
-P_learned = powers_true.copy()                       # (n_epochs, N_patterns)
+# ИЗМЕНЕНО: Правильно вырезаем блок корреляций между Learned и True (размер 12x6)
+corr_block = np.abs(C_corr[:n_learned, n_learned:])                  
 
-# --- Согласование: какой learned-фильтр соответствует какому истинному источнику ---
-# Считаем корреляционную матрицу между временными рядами мощностей
-C_corr = np.corrcoef(P_learned.T, P_true.T)          # (Np+Nd, Np+Nd)
-corr_block = np.abs(C_corr[:N_patterns, N_patterns:])  # (N_patterns, Ndistr)
-
-# Оптимальное назначение (максимизируем сумму |corr|)
+# Венгерский алгоритм
 row, col = linear_sum_assignment(-corr_block)
-# row[k] -> индекс learned, col[k] -> индекс истинного источника
 
-# Применяем перестановку: learned-массивы выстраиваются под истинные источники
-learned_order = row[np.argsort(col)]                # learned i <- источник i
-P_learned_matched = P_learned[:, learned_order]
-A_learned_matched = A_global_norm[:, learned_order]
-W_learned_matched = W_filters_sensor[:, learned_order]
+# Сортируем пары по индексу истинного источника для красоты вывода
+sort_idx = np.argsort(col)
+matched_learned_idx = row[sort_idx]
+matched_true_idx = col[sort_idx]
+num_matched = len(matched_true_idx)
+
+P_learned_matched = P_learned[:, matched_learned_idx]
+A_learned_matched = A_global_norm[:, matched_learned_idx]
+W_learned_matched = W_filters_sensor[:, matched_learned_idx]
+
+print(f"Из {Ndistr} истинных источников алгоритм успешно сопоставил {num_matched} фильтров.")
 
 # =============================================================================
-# 7. ТОПОГРАММЫ: истинные vs согласованные выученные
+# 7. ТОПОГРАММЫ (Только для совпавших пар)
 # =============================================================================
-fig, axes = plt.subplots(2, Ndistr, figsize=(4 * Ndistr, 7))
-for i in range(Ndistr):
+fig, axes = plt.subplots(2, num_matched, figsize=(4 * num_matched, 7))
+if num_matched == 1: axes = np.expand_dims(axes, axis=1) 
+
+# ИЗМЕНЕНО: Заменили жесткое range(6) на range(num_matched)
+for i in range(num_matched):
+    t_idx = matched_true_idx[i]
+    
     ax_t = axes[0, i]
-    mne.viz.plot_topomap(A_true[:, i], info_sub, axes=ax_t, show=False, cmap='RdBu_r')
-    ax_t.set_title(f'True source {i+1}')
+    mne.viz.plot_topomap(A_true[:, t_idx], info_sub, axes=ax_t, show=False, cmap='RdBu_r')
+    ax_t.set_title(f'True Source {t_idx+1}')
 
     ax_l = axes[1, i]
-    mne.viz.plot_topomap(A_learned_matched[:, i], info_sub, axes=ax_l,
-                         show=False, cmap='RdBu_r')
-    ax_l.set_title(f'Learned (matched) {i+1}')
+    mne.viz.plot_topomap(A_learned_matched[:, i], info_sub, axes=ax_l, show=False, cmap='RdBu_r')
+    ax_l.set_title(f'Learned {matched_learned_idx[i]+1}')
 
 plt.tight_layout()
 plt.show()
 
 # =============================================================================
-# 8. КОРРЕЛЯЦИИ ВРЕМЕННЫХ РЯДОВ МОЩНОСТЕЙ
+# 8. КОРРЕЛЯЦИИ (Только для совпавших пар)
 # =============================================================================
-# По-столбцовая нормировка (каждую колонку — к единичной std)
-P_true_n = P_true / P_true.std(axis=0, keepdims=True)
-P_pred_n = P_learned_matched / P_learned_matched.std(axis=0, keepdims=True)
+P_true_matched = P_true[:, matched_true_idx]
+P_true_n = P_true_matched / (P_true_matched.std(axis=0, keepdims=True) + 1e-9)
+P_pred_n = P_learned_matched / (P_learned_matched.std(axis=0, keepdims=True) + 1e-9)
 
-correlations = [
-    np.corrcoef(P_true_n[:, i], P_pred_n[:, i])[0, 1]
-    for i in range(Ndistr)
-]
+correlations = [np.corrcoef(P_true_n[:, i], P_pred_n[:, i])[0, 1] for i in range(num_matched)]
 
-fig, axes = plt.subplots(Ndistr, 1, figsize=(12, 3 * Ndistr), sharex=True)
-fig.suptitle('Мощность источника: истинная vs предсказанная (согласовано)', y=1.02)
-for i in range(Ndistr):
-    ax = axes[i] if Ndistr > 1 else axes
+fig, axes = plt.subplots(num_matched, 1, figsize=(12, 3 * num_matched), sharex=True)
+if num_matched == 1: axes = [axes]
+
+fig.suptitle(f'Мощности: совпало {num_matched} из {Ndistr} источников', y=1.02)
+
+# ИЗМЕНЕНО: Заменили жесткое range(6) на range(num_matched)
+for i in range(num_matched):
+    ax = axes[i]
     ax.plot(P_true_n[:, i], 'b-', lw=2.5, alpha=0.6, label='Истинная')
     ax.plot(P_pred_n[:, i], 'r', lw=1.5, label='Предсказанная')
-    ax.set_title(f'Источник {i+1} (corr = {correlations[i]:.3f})')
+    ax.set_title(f'True {matched_true_idx[i]+1} vs Learned {matched_learned_idx[i]+1} (corr = {correlations[i]:.3f})')
     ax.set_ylabel('Норм. мощность')
     ax.legend(loc='upper right')
     ax.grid(True, linestyle='--', alpha=0.5)
+
 plt.xlabel('Окна')
 plt.tight_layout()
 plt.show()
 
-print("Корреляции по источникам:", correlations)
-
 # %%
+

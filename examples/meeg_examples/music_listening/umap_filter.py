@@ -43,7 +43,7 @@ sfreq = raw.info["sfreq"]
 #     "BAD_", "BAD_", "Waltz_6", "BAD_", "BAD_", "Waltz_7", "Waltz_8"
 # ])
 raw.annotations.description = np.array(['EC1', 'EO1', 'BAD_', '2Hz', '05Hz', '4Hz', '1Hz', '3Hz', 'NoRy 1',
-       'Waltz 1', 'Waltz 2', 'NoRy 2', 'NoRy 3', 'Waltz 3', 'NoRy 4',
+       'Waltz 1', 'Waltz 2', 'NoRy 2', 'NoRy 3', 'Waltz 3', 'NoRy 4', 
        'Waltz 4', 'NoRy 5', 'Waltz 5', 'EC2', 'EO2'])
 
 cond_descriptions = ['EC1', 'EO1', '2Hz', '05Hz', '4Hz', '1Hz', '3Hz', 'NoRy 1',
@@ -68,7 +68,7 @@ raw.set_annotations(new_ann)
 
 data = raw.get_data()
 
-raw.plot()
+# raw.plot()
 
 # %%
 from mne.preprocessing import ICA
@@ -231,7 +231,7 @@ plt.figure(figsize=(10, 8))
 
 # 1. Отрисовываем точки. 
 # Обязательно передаем y в параметр c=y для раскраски
-scatter = plt.scatter(coords[:, 0], coords[:, 1], c=y, s=15, cmap='Spectral', alpha=0.7)
+scatter = plt.scatter(coords[:, 0], coords[:, 1], s=15, cmap='Spectral', alpha=0.7)
 
 # 2. Вычисляем и рисуем центроиды
 unique_classes = np.unique(y)
@@ -275,7 +275,6 @@ def build_unvec_matrix(M):
             W[k, j * M + i] = 1.0 / np.sqrt(2.0)
     return W
 
-
 @tf.keras.utils.register_keras_serializable()
 class UnflattenSymmetricLayer(tf.keras.layers.Layer):
     """Развёртка плоских векторов обратно в симметричные матрицы."""
@@ -303,16 +302,14 @@ class UnflattenSymmetricLayer(tf.keras.layers.Layer):
         config.update({"M": self.M})
         return config
 
-
 @tf.keras.utils.register_keras_serializable()
 class BiMapLayer(tf.keras.layers.Layer):
     """
     Билинейное преобразование: X_out = W_norm · X · W_norm^T
     """
-    def __init__(self, d_out, orth_weight=0.01, **kwargs):
+    def __init__(self, d_out, **kwargs):
         super().__init__(**kwargs)
         self.d_out = int(d_out)
-        self.orth_weight = float(orth_weight)
 
     def build(self, input_shape):
         self.d_in = int(input_shape[-1])
@@ -343,77 +340,55 @@ class BiMapLayer(tf.keras.layers.Layer):
         config = super().get_config()
         config.update({
             "d_out": self.d_out,
-            "orth_weight": self.orth_weight
         })
         return config
 
 @tf.keras.utils.register_keras_serializable()
 class LogDiagScaleLayer(tf.keras.layers.Layer):
     """
-    z_i = scale_i * log( max( (W C W^T)_{ii}, eps ) ) + bias_i
-    (По аналогии с аффинным преобразованием в BatchNorm / LayerNorm)
+    z_i = log( scale_i * max( (W C W^T)_{ii}, eps ) )
+    Штраф за внедиагональные элементы рассчитывается на основе матрицы корреляции.
+    Масштаб строго больше нуля благодаря функции softplus, выступает как усилитель дисперсии.
     """
-    def __init__(self, n_filters, epsilon=1e-7, off_diag_penalty=1, **kwargs):
+    def __init__(self, n_filters, epsilon=1e-9, off_diag_penalty=1.0, **kwargs):
         super().__init__(**kwargs)
         self.n_filters = int(n_filters)
         self.epsilon = epsilon
-        self.off_diag_penalty = off_diag_penalty
+        self.off_diag_penalty = float(off_diag_penalty)
 
     def build(self, input_shape):
-        self.scale = self.add_weight(
-            shape=(self.n_filters,),
-            initializer='ones',
-            trainable=True,
-            name='scale'
-        )
-        self.bias = self.add_weight(
-            shape=(self.n_filters,),
-            initializer='zeros',
-            trainable=True,
-            name='bias'
-        )
         super().build(input_shape)
 
     def call(self, inputs):
         diags = tf.linalg.diag_part(inputs)
         
-        # # --- НАЛОЖЕНИЕ ШТРАФА НА ВНЕДИАГОНАЛЬНЫЕ ЭЛЕМЕНТЫ ---
-        if self.off_diag_penalty > 0.0:
-            #     zeros_diag = tf.zeros_like(diags)
-            #     off_diagonals = tf.linalg.set_diag(inputs, zeros_diag)
-            #     penalty_loss = self.off_diag_penalty * tf.reduce_mean(tf.square(off_diagonals))
-            #     self.add_loss(penalty_loss)
-            # # ----------------------------------------------------
+        if self.off_diag_penalty > 0.0 and self.n_filters > 1:
+            inv_std = tf.math.rsqrt(tf.maximum(diags, self.epsilon))
+            inv_std_col = tf.expand_dims(inv_std, axis=-1)
+            inv_std_row = tf.expand_dims(inv_std, axis=-2)
+            R = inputs * inv_std_col * inv_std_row
             
-            # Аппроксимация информационного критерия Фама (Log-Det penalty)
-            eps_eye = self.epsilon * tf.eye(self.n_filters, dtype=inputs.dtype) 
+            eps_eye = self.epsilon * tf.eye(self.n_filters, dtype=inputs.dtype)
+            log_det_R = tf.linalg.logdet(R + eps_eye)
             
-            # Оставляем sum, так как это математическое требование для лог-детерминанта диагонали
-            log_det_diag = tf.reduce_sum(tf.math.log(tf.maximum(diags, self.epsilon)), axis=-1)
-            log_det_full = tf.linalg.logdet(inputs + eps_eye)
-            
-            # Вычисляем количество пар для инвариантной нормировки
             N = tf.cast(self.n_filters, dtype=inputs.dtype)
-            pairs_count = tf.maximum(N * (N - 1.0) / 2.0, 1.0) # Защита от деления на 0 при N=1
+            pairs_count = tf.maximum(N * (N - 1.0) / 2.0, 1.0) 
             
-            # Нормируем разницу на количество уникальных пар (инвариантность к размеру матрицы)
-            pham_penalty = self.off_diag_penalty * tf.reduce_mean(log_det_diag - log_det_full) / pairs_count
+            pham_penalty = self.off_diag_penalty * tf.reduce_mean(-log_det_R) / pairs_count
             self.add_loss(pham_penalty)
-            
-        z = tf.math.log(tf.maximum(diags, self.epsilon))
-        
-        # Применяем и масштаб (scale), и сдвиг (bias)
-        return self.scale * z + self.bias
+                
+        return tf.math.log(tf.maximum(diags, self.epsilon))
 
     def get_config(self):
         config = super().get_config()
         config.update({
             "n_filters": self.n_filters,
             "epsilon": self.epsilon,
-           "off_diag_penalty": self.off_diag_penalty
+            "off_diag_penalty": self.off_diag_penalty
         })
         return config
-    
+
+# %%
 Npatt = 21
 
 idx_i, idx_j = np.triu_indices(n_components)
@@ -423,8 +398,8 @@ input_dim = int(X_cov_flat.shape[1])
 
 inputs_enc = tf.keras.Input(shape=(input_dim,), dtype=tf.float32)
 x = UnflattenSymmetricLayer(M=n_components)(inputs_enc)
-x = BiMapLayer(d_out=Npatt, orth_weight=0.01, name="bimap_1")(x)
-z_latent = LogDiagScaleLayer(n_filters=Npatt, epsilon=1e-4)(x)
+x = BiMapLayer(d_out=Npatt, name="bimap_1")(x)
+z_latent = LogDiagScaleLayer(n_filters=Npatt, epsilon=1e-7)(x)
 encoder = tf.keras.Model(inputs=inputs_enc, outputs=z_latent)
 
 early_stopping = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=50, min_delta=1e-4)
@@ -437,6 +412,114 @@ embedder = ParametricUMAP(
 embedder.n_training_epochs = 3 
 embedder.loss_report_frequency = embedder.n_training_epochs * 100
 embedder.fit(X_cov_flat, precomputed_distances=dists_init)
+
+# %%
+from scipy.linalg import null_space
+
+n_iterations = 7
+Npatt = 3
+
+W_bimap_list = [] 
+history_list = []
+
+# Списки для сохранения результатов каждой итерации
+covmats_reduced_list = []  
+# dists_list = []            
+
+for it in range(n_iterations):
+    print(f"\n{'='*50}\n ИТЕРАЦИЯ {it + 1} ИЗ {n_iterations}\n{'='*50}")
+    
+    # 1. ПОДГОТОВКА ПОДПРОСТРАНСТВА И РАССТОЯНИЙ
+    if it == 0:
+        # Пропускаем лишние вычисления: берем уже готовые исходные данные
+        V = np.eye(n_components)
+        covmats_reduced = covmats_ssd.copy()
+        dists_current = dists_init.copy()
+    else:
+        # Строим базис нуль-пространства из всех ранее найденных фильтров
+        W_stacked = np.vstack(W_bimap_list)
+        V = null_space(W_stacked).T
+        M_current = V.shape[0]
+        
+        # Проецируем ковариации в меньшую размерность
+        covmats_reduced = np.zeros((len(covmats_ssd), M_current, M_current))
+        for i in range(len(covmats_ssd)):
+            covmats_reduced[i] = V @ covmats_ssd[i] @ V.T
+
+        # Идеальный перерасчет топологии без регуляризации
+        # dists_current = pairwise_distance(covmats_reduced, metric='riemann')
+        # dists_current = pairwise_distance(covmats_reduced, metric='riemann')
+    
+    # Сохраняем спроецированные матрицы и их дистанции в списки
+    covmats_reduced_list.append(covmats_reduced.copy())
+    # dists_list.append(dists_current.copy())
+
+    M_current = V.shape[0]
+    
+    # 2. ВЕКТОРИЗАЦИЯ УМЕНЬШЕННЫХ КОВАРИАЦИЙ
+    idx_i, idx_j = np.triu_indices(M_current)
+    multipliers = np.where(idx_i == idx_j, 1.0, np.sqrt(2.0)).astype(np.float32)
+    X_cov_flat = (covmats_reduced[:, idx_i, idx_j] * multipliers).astype(np.float32)
+    input_dim = int(X_cov_flat.shape[1])
+
+    # 3. ИНИЦИАЛИЗАЦИЯ И ОБУЧЕНИЕ МОДЕЛИ
+    tf.keras.backend.clear_session() # Очищаем память
+    
+    inputs_enc = tf.keras.Input(shape=(input_dim,), dtype=tf.float32)
+    x = UnflattenSymmetricLayer(M=M_current)(inputs_enc)
+    layer_name = f"bimap_{it}"
+    x = BiMapLayer(d_out=Npatt, name=layer_name)(x)
+    z_latent = LogDiagScaleLayer(n_filters=Npatt, epsilon=1e-9)(x)
+    encoder = tf.keras.Model(inputs=inputs_enc, outputs=z_latent)
+
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=50, min_delta=1e-4)
+    embedder = ParametricUMAP(
+        encoder=encoder, n_components=Npatt, dims=(input_dim,), 
+        metric="precomputed", n_neighbors=20, verbose=True,
+        keras_fit_kwargs={"callbacks": [early_stopping], "verbose": 1}
+    )
+
+    embedder.n_training_epochs = 3
+    embedder.loss_report_frequency = embedder.n_training_epochs * 100
+
+    embedder.fit(X_cov_flat, precomputed_distances=dists_current)
+    history_list.append(embedder._history)
+    
+    # 4. ИЗВЛЕЧЕНИЕ ФИЛЬТРА И ВОЗВРАТ В ИСХОДНОЕ ПРОСТРАНСТВО
+    # w_reduced имеет размер (1, M_current)
+    w_reduced = encoder.get_layer(layer_name).get_weights()[0]
+    
+    # Проецируем обратно в исходное отбеленное пространство: (1, M_current) @ (M_current, M) -> (1, M)
+    w_orig = w_reduced @ V
+    
+    # Нормализуем
+    w_orig = w_orig / np.linalg.norm(w_orig, axis=1, keepdims=True)
+    W_bimap_list.append(w_orig)
+
+# =============================================================================
+# ПОСТПРОЦЕССИНГ 
+# =============================================================================
+W_bimap_stacked = np.vstack(W_bimap_list)
+W_sorted = W_ssd @ W_bimap_stacked.T
+
+# Дальнейший код для мощностей, сортировки и отрисовки...
+
+# 2. РАСЧЕТ ИСТИННЫХ МОЩНОСТЕЙ ИСТОЧНИКОВ
+powers = np.zeros((len(covmats_ssd), n_iterations * Npatt))
+for i, C in enumerate(covmats_ssd):
+    # Применяем матрицу ко всем ИСХОДНЫМ отбеленным ковариациям
+    C_filtered = W_bimap_stacked @ C @ W_bimap_stacked.T
+    powers[i] = np.diag(C_filtered)
+
+# Расчет паттернов: A = Sigma_mean * W
+A_sensor_raw = np.mean(covmats_band, axis=0) @ W_sorted
+
+# Нормировка физических паттернов для визуализации
+scales = np.linalg.norm(A_sensor_raw, axis=0)
+A_sorted = A_sensor_raw / scales
+
+found_filters = [W_sorted[:, i] for i in range(n_iterations * Npatt)]
+found_patterns = [A_sorted[:, i] for i in range(n_iterations * Npatt)]
 
 # %%
 # =============================================================================
@@ -603,7 +686,7 @@ def format_umap_axes(ax):
 # ВЫБОР КОМПОНЕНТЫ
 # =============================================================================
 # Выбираем индекс паттерна (0..Npatt-1)
-comp_idx = 20 
+comp_idx = 0 
 
 # Берём фильтр, который ВЫУЧИЛА НЕЙРОСЕТЬ (из матрицы W)
 W_sensor = found_filters[comp_idx] 
