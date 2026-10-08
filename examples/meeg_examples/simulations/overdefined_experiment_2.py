@@ -72,30 +72,18 @@ def make_microstate_schedule(N, Fs, n_states, dwell_time,
 def generate_microstate_sources(
     G, Nsrc, N_microstates=2, sources_per_microstate=10,
     flanker=25.0, Ts=600, Fs=100,
-    dwell_time=5.0,                # длительность одного микросостояния
-    snr_active=2.0,                # P_target / P_bg, когда микростат активен
-    snr_inactive=0.1,              # P_target / P_bg, когда микростат молчит
-    schedule='round_robin',        # 'round_robin' или 'random'
-    smooth_s=0.05,                 # сглаживание фронтов микростатов
-    transition_freq=0.5,           # ФНЧ огибающей (как в исходной функции)
+    dwell_time=5.0,                
+    snr_active=2.0,                
+    snr_inactive=0.1,              
+    schedule='round_robin',        
+    smooth_s=0.05,                 
+    transition_freq=0.5,           
+    source_corr=0,               # <--- НОВЫЙ ПАРАМЕТР: степень корреляции (0.0 - 1.0)
+    use_sine_carrier=True        
 ):
     """
-    Все источники (и таргет, и фон) формируются ОДИНАКОВО:
-        signal_k(t) = unit_sinusoid_k(t) · env_unit_k(t) · scale_k(t)
-    где env_unit — LP-фильтрованный положительный шум с E[env_unit²]=1,
-    одна и та же природа для всех.
-
-    Отличия:
-      * фон:   scale = 1 (всегда одинаково "активен").
-      * таргет: scale_k(t) = sqrt( snr_inactive + (snr_active - snr_inactive) · a_μ(k)(t) )
-
-    Микросостояния:
-      * источники 0..Ndistr-1 поделены на N_microstates групп по P штук;
-      * a_μ(t) ∈ {0,1} — расписание, в каждый момент активен один микростат;
-      * источники одной группы активируются синхронно (общая огибающая — у них
-        свои, но их мощность масштабируется одной и той же маской a_μ(t)).
-
-    Средний по времени SNR источника: snr_inactive + Δsnr·mean(a_μ).
+    Генерирует источники, где источники внутри одного микросостояния могут
+    быть скоррелированы по фазе и огибающей на заданную величину source_corr.
     """
     N = int(Ts * Fs)
     flanker_samples = int(flanker * Fs)
@@ -115,46 +103,72 @@ def generate_microstate_sources(
         r = np.random.rand(3); r /= np.linalg.norm(r)
         GA[:, i] = Gx[:, src_inds[i]]*r[0] + Gy[:, src_inds[i]]*r[1] + Gz[:, src_inds[i]]*r[2]
 
-    # --- Несущие (band-pass, единичная огибающая) -------------------------
+    # --- Несущие (band-pass, гауссовские, zero-mean) ----------------------
     raw_noise = np.random.randn(Nsrc, N + 2*flanker_samples)
     S_full = filtfilt(b, a, raw_noise, axis=1)
     S = (S_full[:, flanker_samples:-flanker_samples]
          if flanker_samples > 0 else S_full.copy())
 
-    # --- Огибающие: одна природа для таргета и фона -----------------------
+    # --- Огибающие (low-pass, гауссовские, zero-mean) ---------------------
     raw_env = np.random.randn(Nsrc, N + 2*flanker_samples)
     env_full = filtfilt(b_lp, a_lp, raw_env, axis=1)
     if flanker_samples > 0:
         env_full = env_full[:, flanker_samples:-flanker_samples]
 
+    # =====================================================================
+    # --- ВНЕДРЕНИЕ КОРРЕЛЯЦИИ --------------------------------------------
+    # =====================================================================
+    if sources_per_microstate > 1 and source_corr > 0.0:
+        rho = source_corr
+        blend_w = np.sqrt(1.0 - rho**2)
+        
+        for mu in range(N_microstates):
+            base_idx = mu * sources_per_microstate
+            for j in range(1, sources_per_microstate):
+                idx = base_idx + j
+                
+                # Смешиваем несущие сигналы
+                S[idx, :] = rho * S[base_idx, :] + blend_w * S[idx, :]
+                
+                # Смешиваем огибающие
+                env_full[idx, :] = rho * env_full[base_idx, :] + blend_w * env_full[idx, :]
+
+    # =====================================================================
+
+    # --- Нелинейные преобразования огибающей ---
     # Dähne-подобное смещение: делаем строго положительной
     env_pos = env_full - env_full.min(axis=1, keepdims=True) + 0.05
-    # Нормируем по RMS, чтобы E[env_unit²] = 1 (истинная средняя мощность 1)
+    # Нормируем по RMS, чтобы E[env_unit²] = 1
     env_unit = env_pos / np.sqrt(np.mean(env_pos**2, axis=1, keepdims=True))
 
     # --- Расписание микросостояний ----------------------------------------
     A = make_microstate_schedule(
         N, Fs, N_microstates, dwell_time,
         mode=schedule, smooth_s=smooth_s
-    )  # (N_microstates, N), ∈ [0,1]
+    )
 
     # --- Синтез источников -------------------------------------------------
     z = np.zeros((Nsrc, N))
     for k in range(Nsrc):
-        analytic = hilbert(S[k, :])
-        S_norm   = S[k, :] / (np.abs(analytic) + 1e-12)   # чистая синусоида, амплитуда 1
+        
+        if use_sine_carrier:
+            # Оригинальный метод: принудительно делаем идеальный синус (kurtosis = -1.5)
+            analytic = hilbert(S[k, :])
+            S_norm = S[k, :] / (np.abs(analytic) + 1e-12)
+        else:
+            # Наш метод: оставляем гауссовский узкополосный шум (kurtosis = 0)
+            S_norm = S[k, :] / np.std(S[k, :])
 
         if k < Ndistr:
             mu = k // sources_per_microstate
-            a_k = A[mu]                                     # (N,) ∈ [0,1]
+            a_k = A[mu]                                     
             snr_k = snr_inactive + (snr_active - snr_inactive) * a_k
-            scale = np.sqrt(np.clip(snr_k, 1e-12, None))    # амплитудный масштаб
+            scale = np.sqrt(np.clip(snr_k, 1e-12, None))    
         else:
-            scale = 1.0                                     # bg baseline
+            scale = 1.0                                     
 
         S[k, :] = S_norm * env_unit[k] * scale
-        z[k, :] = (env_unit[k]**2) * (scale**2 if np.isscalar(scale)
-                                      else scale**2)
+        z[k, :] = (env_unit[k]**2) * (scale**2 if np.isscalar(scale) else scale**2)
 
     X_s  = GA[:, :Ndistr]  @ S[:Ndistr, :]
     X_bg = GA[:, Ndistr:]  @ S[Ndistr:, :]
@@ -188,7 +202,7 @@ M_channels = len(picks)
 Ts = 600          
 Nsrc = 100         
 N_microstates = 2               
-sources_per_microstate = 1
+sources_per_microstate = 2
 Ndistr = N_microstates * sources_per_microstate  
 
 flanker = 25.0        
@@ -479,12 +493,8 @@ class BiMapLayer(tf.keras.layers.Layer):
     def build(self, input_shape):
         self.d_in = int(input_shape[-1])
         
-        # Базовая структура единичной матрицы
-        init_val = np.eye(self.d_out, self.d_in, dtype=np.float32)
-        
-        # Добавляем небольшой гауссовский шум для нарушения симметрии
-        noise = np.random.normal(loc=0.0, scale=0.01, size=(self.d_out, self.d_in)).astype(np.float32)
-        init_val = init_val + noise
+        initializer = tf.keras.initializers.Orthogonal()
+        init_val = initializer(shape=(self.d_out, self.d_in)).numpy()
         
         self.W = self.add_weight(
             shape=(self.d_out, self.d_in),
@@ -645,7 +655,7 @@ found_patterns = [A_sorted[:, i] for i in range(Npatt)]
 from scipy.linalg import null_space
 
 n_iterations = sources_per_microstate * N_microstates
-Npatt = 1
+Npatt = 1 
 
 W_bimap_list = [] 
 history_list = []

@@ -28,7 +28,7 @@ import matplotlib as mpl
 
 # %%
 # 1. Путь к файлу
-fpath = "C:/Users/ansbel/Documents/GitHub/TriCo/data/external/music_listening/part1/eeg/10_07_g1_2223_raw.fif"
+fpath = "C:/Users/ansbel/Downloads/10_07_g1_2223_raw.fif"
 raw = mne.io.read_raw_fif(fpath, preload=True)
 
 # 2. Частота дискретизации
@@ -68,7 +68,7 @@ raw.set_annotations(new_ann)
 
 data = raw.get_data()
 
-# raw.plot()
+raw.plot()
 
 # %%
 from mne.preprocessing import ICA
@@ -314,12 +314,8 @@ class BiMapLayer(tf.keras.layers.Layer):
     def build(self, input_shape):
         self.d_in = int(input_shape[-1])
         
-        # Базовая структура единичной матрицы
-        init_val = np.eye(self.d_out, self.d_in, dtype=np.float32)
-        
-        # Добавляем небольшой гауссовский шум для нарушения симметрии
-        noise = np.random.normal(loc=0.0, scale=0.01, size=(self.d_out, self.d_in)).astype(np.float32)
-        init_val = init_val + noise
+        initializer = tf.keras.initializers.Orthogonal()
+        init_val = initializer(shape=(self.d_out, self.d_in)).numpy()
         
         self.W = self.add_weight(
             shape=(self.d_out, self.d_in),
@@ -350,7 +346,7 @@ class LogDiagScaleLayer(tf.keras.layers.Layer):
     Штраф за внедиагональные элементы рассчитывается на основе матрицы корреляции.
     Масштаб строго больше нуля благодаря функции softplus, выступает как усилитель дисперсии.
     """
-    def __init__(self, n_filters, epsilon=1e-9, off_diag_penalty=1.0, **kwargs):
+    def __init__(self, n_filters, epsilon=1e-9, off_diag_penalty=0.0, **kwargs):
         super().__init__(**kwargs)
         self.n_filters = int(n_filters)
         self.epsilon = epsilon
@@ -496,6 +492,7 @@ for it in range(n_iterations):
     w_orig = w_orig / np.linalg.norm(w_orig, axis=1, keepdims=True)
     W_bimap_list.append(w_orig)
 
+# %%
 # =============================================================================
 # ПОСТПРОЦЕССИНГ 
 # =============================================================================
@@ -527,14 +524,13 @@ found_patterns = [A_sorted[:, i] for i in range(n_iterations * Npatt)]
 # =============================================================================
 import matplotlib.pyplot as plt
 
-history = embedder._history
-
 # Создаем фигуру с двумя подграфиками (для Recon и для UMAP)
 fig, ax1 = plt.subplots(1, 1)
 # --- График 2: Истинный лосс графа UMAP ---
-ax1.plot(history['umap_loss'], label='UMAP Graph Loss (Cross-Entropy)', color='purple', linewidth=2)
+for idx, hist in enumerate(history_list):
+    ax1.plot(hist['umap_loss'], label=idx+1, linewidth=2)
     
-ax1.set_title('Качество кодера')
+ax1.set_title('Сохранение топологии')
 ax1.set_xlabel('Шаги оценки')
 ax1.set_ylabel('Cross-Entropy')
 ax1.legend()
@@ -581,6 +577,9 @@ print("Визуальное пространство обучено!")
 
 # %%
 plt.scatter(umap_coords[:,0], umap_coords[:,1])
+
+# %%
+umap_coords = coords 
 
 # %%
 import numpy as np
@@ -686,7 +685,7 @@ def format_umap_axes(ax):
 # ВЫБОР КОМПОНЕНТЫ
 # =============================================================================
 # Выбираем индекс паттерна (0..Npatt-1)
-comp_idx = 0 
+comp_idx = 20 
 
 # Берём фильтр, который ВЫУЧИЛА НЕЙРОСЕТЬ (из матрицы W)
 W_sensor = found_filters[comp_idx] 
